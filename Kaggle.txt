@@ -1,0 +1,162 @@
+Overview
+CSE 164 Final Project 2026
+Build a computer vision system for image-level classification and pixel-level semantic segmentation.
+
+In this project, you are given image-level labels, segmentation masks, unlabeled images, and a public validation set. For each hidden test image, your system must predict both:
+
+an image-level class label
+a pixel-level semantic segmentation mask
+The main challenge is semantic segmentation. Your final system should learn from limited labeled data and make effective use of the provided unlabeled data.
+
+Important: pretrained model weights are not allowed. All models used for final submissions must be trained from scratch using only the provided competition data.
+
+Start
+
+12 days ago
+Close
+
+12 days to go
+Description
+CSE 164 Final Project 2026
+Task
+This final project focuses on semi supervised image classification and semantic segmentation.
+
+You are given:
+
+a small image level labeled training set
+a smaller segmentation labeled training set
+a large unlabeled training set
+a public validation set
+a hidden test set
+For each hidden test image, your system must predict:
+
+an image level class label
+a pixel level semantic segmentation mask
+Segmentation is the main challenge and carries most of the Kaggle score.
+
+Data
+The dataset contains the following folders:
+
+data/
+├── train_labeled/
+│   └── images/
+├── train_seg/
+│   ├── images/
+│   └── masks/
+├── train_unlabeled/
+│   └── images/
+├── val/
+│   ├── images/
+│   ├── masks/
+│   └── classification.json
+├── test/
+│   └── images/
+└── metadata/
+    ├── class_map.json
+    ├── train_labeled.json
+    └── train_seg.json
+Dataset size:
+
+Target classes: 300
+Image level labeled training images: 7,500
+Segmentation labeled training images: 3,000
+Unlabeled training images: 50,000
+Public validation images: 750
+Hidden test images: 3,000
+The unlabeled training set may contain a small number of distractor images from non target classes.
+
+Labels
+Classification labels are integer class_id values in 0..299.
+
+Training and validation segmentation masks are PNG images using RGB encoded ids:
+
+segmentation_id = R + G * 256
+Ground truth segmentation ids are:
+
+0: background or non target category
+1..300: foreground classes
+1000: ignore region
+For foreground classes:
+
+segmentation_id = class_id + 1
+The id 1000 appears only in ground truth masks as ignore regions. These pixels are not scored.
+
+Prediction segmentation ids must be in 0..300. The id 1000 must not be used in submitted predictions.
+
+Kaggle Submission Format
+Kaggle submissions use a CSV file with RLE encoded segmentation masks.
+
+Each submission must contain the following columns:
+
+image,class_id,segmentation_rle
+Example:
+
+image,class_id,segmentation_rle
+test_00000.JPEG,17,1 20 18 300 15 18
+test_00001.JPEG,3,0
+The value 0 in the segmentation_rle column means an all background predicted mask.
+
+See the Evaluation page for the full submission format and scoring details.
+
+Important Rule
+Pretrained model weights are not allowed.
+
+This includes ImageNet pretrained backbones, self supervised pretrained models, pretrained segmentation models, foundation models, vision language models, and any public checkpoint initialized from pretrained weights.
+
+All models used for final submissions must be trained from scratch using only the provided competition data.
+
+Public Python packages, course materials, public documentation, and coding assistants may be used for programming help. See the Rules page for the full policy.
+
+Suggested Directions
+Strong projects will usually need more than direct supervised training on the segmentation labeled images. Possible directions include:
+
+multi task learning with a shared encoder
+pseudo labeling high confidence unlabeled images
+confidence filtering for distractor images
+boundary aware losses or post processing
+class balanced sampling for rare classes
+test time augmentation and model ensembling
+You are not required to use any particular architecture.
+
+Evaluation
+Submissions are evaluated on the hidden test set.
+
+The Kaggle leaderboard score is based on classification and segmentation performance:
+
+Kaggle score = 70% segmentation + 20% classification
+The segmentation score is:
+
+Segmentation score =
+  70% mean IoU
++ 20% boundary F-score
++ 10% rare-class mIoU
+Classification is scored with macro accuracy.
+
+Mean IoU and rare-class mIoU are computed over foreground classes only. Background is not included in the class average.
+
+The remaining 10% report/code reproducibility component is graded separately outside Kaggle.
+
+Submission File
+Submit one CSV file named submission.csv with the following columns:
+
+image,class_id,segmentation_rle
+test_00000.JPEG,17,1 20 18 300 15 18
+test_00001.JPEG,3,0
+Columns:
+
+image: test image filename.
+class_id: predicted image-level class in 0..299.
+segmentation_rle: row-major, 1-indexed RLE triples for non-background mask pixels.
+The RLE format is:
+
+start length value start length value ...
+start is 1-indexed after row-major flattening, length is the run length, and value is the predicted segmentation id in 1..300.
+
+The value 0 in segmentation_rle means an all-background predicted mask.
+
+Prediction segmentation ids must be in 0..300.
+
+0: background or non-target category
+1..300: foreground classes
+1000: reserved for ground-truth ignore regions and not allowed in submissions
+Submissions with missing rows, duplicate rows, invalid filenames, invalid class ids, invalid RLE strings, overlapping RLE runs, or invalid segmentation ids may fail validation or receive a score of zero.

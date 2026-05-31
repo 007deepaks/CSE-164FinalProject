@@ -1,0 +1,52 @@
+# Python environments
+.venv/
+venv/
+env/
+
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environment files and secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Kaggle credentials should never live in this repo
+kaggle.json
+access_token
+
+# Dataset and generated data
+data/raw/
+data/processed/
+data/interim/
+
+# Model outputs and experiment artifacts
+outputs/
+runs/
+wandb/
+mlruns/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Large/archive/generated files
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.npy
+*.npz
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
