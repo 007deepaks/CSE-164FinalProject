@@ -23,6 +23,7 @@ class SegmentationSample:
     image_path: Path
     mask_path: Path | None
     image_name: str
+    class_id: int | None = None
 
 
 def _read_json(path: Path) -> object:
@@ -45,6 +46,14 @@ def mask_to_tensor(mask_path: Path, image_size: int = DEFAULT_IMAGE_SIZE) -> tor
     return torch.from_numpy(np.asarray(mask_image, dtype=np.int64))
 
 
+def semantic_to_binary_mask(semantic_mask: torch.Tensor) -> torch.Tensor:
+    """Convert ids 1..300 to foreground=1 while preserving ignore=1000."""
+    binary = torch.zeros_like(semantic_mask)
+    binary[(semantic_mask > 0) & (semantic_mask != 1000)] = 1
+    binary[semantic_mask == 1000] = 1000
+    return binary
+
+
 class SegmentationDataset(Dataset[dict[str, object]]):
     """Dataset for train_seg and val segmentation splits."""
 
@@ -53,13 +62,17 @@ class SegmentationDataset(Dataset[dict[str, object]]):
         data_root: str | Path = "data/raw",
         split: str = "train_seg",
         image_size: int = DEFAULT_IMAGE_SIZE,
+        target_mode: str = "binary",
         max_samples: int | None = None,
     ) -> None:
         if split not in {"train_seg", "val"}:
             raise ValueError("split must be 'train_seg' or 'val'")
+        if target_mode not in {"binary", "semantic"}:
+            raise ValueError("target_mode must be 'binary' or 'semantic'")
         self.data_root = Path(data_root)
         self.split = split
         self.image_size = image_size
+        self.target_mode = target_mode
         self.samples = self._load_samples()
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
@@ -72,17 +85,21 @@ class SegmentationDataset(Dataset[dict[str, object]]):
                     image_path=self.data_root / str(row["image"]),
                     mask_path=self.data_root / str(row["mask"]),
                     image_name=Path(str(row["image"])).name,
+                    class_id=int(row["class_id"]),
                 )
                 for row in rows
             ]
 
         image_dir = self.data_root / "val" / "images"
         mask_dir = self.data_root / "val" / "masks"
+        class_rows = _read_json(self.data_root / "val" / "classification.json")
+        class_by_image = {str(row["image"]): int(row["class_id"]) for row in class_rows}
         return [
             SegmentationSample(
                 image_path=image_path,
                 mask_path=mask_dir / f"{image_path.stem}.png",
                 image_name=image_path.name,
+                class_id=class_by_image[image_path.name],
             )
             for image_path in sorted(image_dir.glob("*.JPEG"))
         ]
@@ -97,10 +114,13 @@ class SegmentationDataset(Dataset[dict[str, object]]):
             original_size = image.size
         if sample.mask_path is None:
             raise ValueError("SegmentationDataset requires masks")
-        mask_tensor = mask_to_tensor(sample.mask_path, self.image_size)
+        semantic_mask = mask_to_tensor(sample.mask_path, self.image_size)
+        mask_tensor = semantic_to_binary_mask(semantic_mask) if self.target_mode == "binary" else semantic_mask
         return {
             "image": image_tensor,
             "mask": mask_tensor,
+            "semantic_mask": semantic_mask,
+            "class_id": int(sample.class_id) if sample.class_id is not None else -1,
             "image_name": sample.image_name,
             "original_size": original_size,
             "original_width": original_size[0],

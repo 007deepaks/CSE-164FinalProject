@@ -163,6 +163,80 @@ def inspect_masks(data_root: Path, sample_masks: int, frequency_masks: int, rand
     print(f"  top foreground ids: {top}")
 
 
+def audit_all_train_seg_masks(data_root: Path) -> None:
+    """Audit every train_seg example for foreground ids and metadata consistency."""
+    rows = load_json(data_root / "metadata" / "train_seg.json")
+    if not isinstance(rows, list):
+        raise TypeError("metadata/train_seg.json should contain a list of rows")
+
+    masks_with_multiple_foreground_ids = 0
+    masks_with_no_foreground_ids = 0
+    metadata_mismatch_count = 0
+    invalid_id_example_count = 0
+    metadata_mismatches: list[dict[str, object]] = []
+    invalid_id_examples: list[dict[str, object]] = []
+    foreground_id_by_mask_presence: Counter[int] = Counter()
+    foreground_pixel_counts: Counter[int] = Counter()
+
+    for index, row in enumerate(rows, start=1):
+        mask_path = data_root / str(row["mask"])
+        expected_segmentation_id = int(row["class_id"]) + 1
+        metadata_segmentation_id = int(row.get("segmentation_id", expected_segmentation_id))
+        mask = decode_rgb_mask(mask_path)
+        ids, counts = np.unique(mask, return_counts=True)
+        ids_int = [int(mask_id) for mask_id in ids]
+        foreground_ids = [mask_id for mask_id in ids_int if 1 <= mask_id <= NUM_CLASSES]
+
+        if len(foreground_ids) > 1:
+            masks_with_multiple_foreground_ids += 1
+        if not foreground_ids:
+            masks_with_no_foreground_ids += 1
+
+        foreground_id_by_mask_presence.update(foreground_ids)
+        for mask_id, pixel_count in zip(ids_int, counts):
+            if 1 <= mask_id <= NUM_CLASSES:
+                foreground_pixel_counts[mask_id] += int(pixel_count)
+
+        invalid_ids = [mask_id for mask_id in ids_int if mask_id not in range(NUM_CLASSES + 1) and mask_id != IGNORE_ID]
+        if invalid_ids:
+            invalid_id_example_count += 1
+            if len(invalid_id_examples) < 10:
+                invalid_id_examples.append({"mask": str(row["mask"]), "invalid_ids": invalid_ids})
+
+        if metadata_segmentation_id != expected_segmentation_id or foreground_ids != [expected_segmentation_id]:
+            metadata_mismatch_count += 1
+            if len(metadata_mismatches) < 20:
+                metadata_mismatches.append(
+                    {
+                        "mask": str(row["mask"]),
+                        "class_id": int(row["class_id"]),
+                        "metadata_segmentation_id": metadata_segmentation_id,
+                        "expected_segmentation_id": expected_segmentation_id,
+                        "foreground_ids_in_mask": foreground_ids,
+                    }
+                )
+
+        if index % 500 == 0:
+            print(f"  audited {index}/{len(rows)} masks")
+
+    print("\nFull train_seg audit")
+    print(f"  total masks audited: {len(rows)}")
+    print(f"  masks containing >1 foreground segmentation_id: {masks_with_multiple_foreground_ids}")
+    print(f"  masks containing no foreground segmentation_id: {masks_with_no_foreground_ids}")
+    print(f"  unique foreground ids observed: {len(foreground_id_by_mask_presence)}")
+    print(f"  metadata/id consistency mismatches: {metadata_mismatch_count}")
+    if metadata_mismatches:
+        print(f"    first mismatches: {metadata_mismatches[:5]}")
+    print(f"  masks with invalid ids: {invalid_id_example_count}")
+    if invalid_id_examples:
+        print(f"    first invalid id examples: {invalid_id_examples[:5]}")
+
+    by_presence = dict(sorted(foreground_id_by_mask_presence.items()))
+    by_pixels_top = foreground_pixel_counts.most_common(20)
+    print(f"  distribution of foreground ids by mask presence: {by_presence}")
+    print(f"  top foreground ids by pixel count: {by_pixels_top}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, default=Path("data/raw"))
@@ -171,6 +245,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-masks", type=int, default=5)
     parser.add_argument("--frequency-masks", type=int, default=50)
     parser.add_argument("--random-seed", type=int, default=164)
+    parser.add_argument("--audit-all-train-seg", action="store_true")
     return parser.parse_args()
 
 
@@ -185,6 +260,8 @@ def main() -> None:
     print_split_counts(data_root, args.size_sample)
     check_segmentation_pairs(data_root, args.pair_check_limit)
     inspect_masks(data_root, args.sample_masks, args.frequency_masks, args.random_seed)
+    if args.audit_all_train_seg:
+        audit_all_train_seg_masks(data_root)
 
 
 if __name__ == "__main__":

@@ -13,8 +13,8 @@ from torch.utils.data import DataLoader
 from src.data.segmentation_dataset import SegmentationDataset
 from src.metrics.segmentation_metrics import SegmentationMetricTracker
 from src.models.segmentation_model import build_segmentation_model
-from src.training.train_segmentation import save_prediction_panels
-from src.utils.masks import IGNORE_ID
+from src.training.train_segmentation import save_prediction_panels, semantic_prediction_from_logits
+from src.utils.masks import IGNORE_ID, NUM_CLASSES
 
 
 @torch.no_grad()
@@ -30,7 +30,11 @@ def evaluate(
     num_visualizations: int,
 ) -> dict[str, float]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = SegmentationDataset(data_root, "val", image_size, max_val_samples)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    resolved_base_channels = base_channels or int(checkpoint.get("args", {}).get("base_channels", 32))
+    target_mode = str(checkpoint.get("args", {}).get("target_mode", "semantic"))
+    output_classes = 2 if target_mode == "binary" else NUM_CLASSES + 1
+    dataset = SegmentationDataset(data_root, "val", image_size, target_mode, max_val_samples)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -38,28 +42,29 @@ def evaluate(
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
     )
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    resolved_base_channels = base_channels or int(checkpoint.get("args", {}).get("base_channels", 32))
-    model = build_segmentation_model(num_classes=301, base_channels=resolved_base_channels).to(device)
+    model = build_segmentation_model(num_classes=output_classes, base_channels=resolved_base_channels).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_ID)
-    tracker = SegmentationMetricTracker(ignore_index=IGNORE_ID)
+    tracker = SegmentationMetricTracker(num_classes=NUM_CLASSES + 1, ignore_index=IGNORE_ID)
     running_loss = 0.0
     saved_visuals = False
 
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
+        semantic_masks = batch["semantic_mask"].to(device, non_blocking=True)
+        class_ids = batch["class_id"].to(device, non_blocking=True)
         logits = model(images)
         running_loss += float(criterion(logits, masks).item())
-        tracker.update(logits, masks)
+        semantic_predictions = semantic_prediction_from_logits(logits, class_ids, target_mode)
+        tracker.update_predictions(semantic_predictions, semantic_masks)
         if not saved_visuals and num_visualizations > 0:
             save_prediction_panels(
                 images.cpu(),
-                masks.cpu(),
-                logits.cpu(),
+                semantic_masks.cpu(),
+                semantic_predictions.cpu(),
                 figure_dir,
                 prefix="eval_val",
                 max_examples=num_visualizations,

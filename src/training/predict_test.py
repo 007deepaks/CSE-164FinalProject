@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 
 from src.data.segmentation_dataset import TestImageDataset
 from src.models.segmentation_model import build_segmentation_model
-from src.utils.masks import encode_mask_to_rle, validate_prediction_mask
+from src.utils.masks import NUM_CLASSES, encode_mask_to_rle, validate_prediction_mask
 
 
 def infer_class_id(mask: np.ndarray) -> int:
@@ -25,6 +25,17 @@ def infer_class_id(mask: np.ndarray) -> int:
         return 0
     segmentation_id = Counter(foreground.astype(np.int64).tolist()).most_common(1)[0][0]
     return max(0, min(299, int(segmentation_id) - 1))
+
+
+def load_class_predictions(class_csv: Path | None) -> dict[str, int]:
+    if class_csv is None:
+        return {}
+    frame = pd.read_csv(class_csv)
+    required = {"image", "class_id"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"Class CSV is missing columns: {sorted(missing)}")
+    return {str(row.image): int(row.class_id) for row in frame.itertuples(index=False)}
 
 
 @torch.no_grad()
@@ -37,6 +48,8 @@ def predict(
     num_workers: int,
     base_channels: int | None,
     max_test_samples: int | None,
+    class_csv: Path | None,
+    default_class_id: int,
     validate_with_starter: bool,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -50,9 +63,17 @@ def predict(
     )
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     resolved_base_channels = base_channels or int(checkpoint.get("args", {}).get("base_channels", 32))
-    model = build_segmentation_model(num_classes=301, base_channels=resolved_base_channels).to(device)
+    target_mode = str(checkpoint.get("args", {}).get("target_mode", "semantic"))
+    output_classes = 2 if target_mode == "binary" else NUM_CLASSES + 1
+    model = build_segmentation_model(num_classes=output_classes, base_channels=resolved_base_channels).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
+    class_predictions = load_class_predictions(class_csv)
+    if target_mode == "binary":
+        print(
+            "Binary checkpoint: converting foreground pixels to class_id + 1. "
+            f"class_csv={class_csv}, default_class_id={default_class_id}"
+        )
 
     rows: list[dict[str, object]] = []
     for batch_index, batch in enumerate(loader, start=1):
@@ -67,12 +88,19 @@ def predict(
                 mode="bilinear",
                 align_corners=False,
             )
-            mask = torch.argmax(resized_logits, dim=1).squeeze(0).cpu().numpy().astype(np.uint16)
+            raw_prediction = torch.argmax(resized_logits, dim=1).squeeze(0).cpu().numpy().astype(np.uint16)
+            if target_mode == "binary":
+                class_id = int(class_predictions.get(str(image_name), default_class_id))
+                class_id = max(0, min(NUM_CLASSES - 1, class_id))
+                mask = np.where(raw_prediction == 1, class_id + 1, 0).astype(np.uint16)
+            else:
+                mask = raw_prediction
+                class_id = infer_class_id(mask)
             validate_prediction_mask(mask)
             rows.append(
                 {
                     "image": str(image_name),
-                    "class_id": infer_class_id(mask),
+                    "class_id": class_id,
                     "segmentation_rle": encode_mask_to_rle(mask),
                 }
             )
@@ -111,6 +139,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--base-channels", type=int)
     parser.add_argument("--max-test-samples", type=int)
+    parser.add_argument("--class-csv", type=Path)
+    parser.add_argument("--default-class-id", type=int, default=0)
     parser.add_argument("--no-validate", action="store_true")
     return parser.parse_args()
 
@@ -126,6 +156,8 @@ def main() -> None:
         num_workers=args.num_workers,
         base_channels=args.base_channels,
         max_test_samples=args.max_test_samples,
+        class_csv=args.class_csv,
+        default_class_id=args.default_class_id,
         validate_with_starter=not args.no_validate,
     )
 

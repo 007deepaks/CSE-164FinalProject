@@ -123,6 +123,12 @@ Prediction masks must never use `1000`.
 This baseline trains a compact U-Net-style CNN from scratch. It does not use
 pretrained weights or pretrained backbones.
 
+The default training target is now `--target-mode binary`. This matches the
+observed `train_seg` structure: every segmentation mask contains background and
+exactly one foreground `segmentation_id`, and that id is always
+`class_id + 1`. During validation, binary foreground predictions are converted
+back to semantic ids using the known validation `class_id`.
+
 Install dependencies:
 
 ```powershell
@@ -139,6 +145,12 @@ Normal first baseline training run:
 
 ```powershell
 python -m src.training.train_segmentation --data-root data/raw --epochs 10 --batch-size 8 --base-channels 32
+```
+
+Useful explicit binary-loss settings:
+
+```powershell
+python -m src.training.train_segmentation --data-root data/raw --epochs 10 --batch-size 8 --base-channels 32 --target-mode binary --background-weight 0.05 --foreground-weight 1.0
 ```
 
 Outputs:
@@ -163,6 +175,10 @@ python -m src.training.predict_test --checkpoint outputs/checkpoints/best_segmen
 ```
 
 The prediction script upsamples model logits back to each test image's original
-resolution, converts the predicted ids to Kaggle RLE, derives a simple
-`class_id` from the most common non-background segmentation id, and validates
-the full test CSV with the starter validator.
+resolution, converts the predicted ids to Kaggle RLE, and validates the full
+test CSV with the starter validator.
+
+For a binary checkpoint, test-time semantic ids require a class source. Until a
+classifier is added, `predict_test.py` uses `--default-class-id 0`, which keeps
+the CSV valid but is not a strong final test strategy. Later, pass a CSV with
+`image,class_id` using `--class-csv`.

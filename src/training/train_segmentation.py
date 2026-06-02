@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from src.data.segmentation_dataset import IMAGE_MEAN, IMAGE_STD, SegmentationDataset
 from src.metrics.segmentation_metrics import SegmentationMetricTracker
 from src.models.segmentation_model import build_segmentation_model
-from src.utils.masks import IGNORE_ID
+from src.utils.masks import IGNORE_ID, NUM_CLASSES
 
 
 def denormalize_image(image: torch.Tensor) -> np.ndarray:
@@ -36,22 +36,37 @@ def colorize_mask(mask: np.ndarray) -> Image.Image:
     return Image.fromarray(colors, mode="RGB")
 
 
+def semantic_prediction_from_logits(
+    logits: torch.Tensor,
+    class_ids: torch.Tensor,
+    target_mode: str,
+) -> torch.Tensor:
+    """Convert model logits to semantic ids 0..300 for validation/submission metrics."""
+    predictions = torch.argmax(logits.detach(), dim=1)
+    if target_mode == "semantic":
+        return predictions
+    semantic = torch.zeros_like(predictions)
+    foreground = predictions == 1
+    semantic_ids = (class_ids.to(predictions.device).long() + 1).view(-1, 1, 1)
+    return torch.where(foreground, semantic_ids.expand_as(predictions), semantic)
+
+
 def save_prediction_panels(
     images: torch.Tensor,
     masks: torch.Tensor,
-    logits: torch.Tensor,
+    predictions: torch.Tensor,
     output_dir: Path,
     prefix: str,
     max_examples: int,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    predictions = torch.argmax(logits.detach(), dim=1).cpu().numpy()
+    predictions_np = predictions.detach().cpu().numpy()
     masks_np = masks.detach().cpu().numpy()
     count = min(max_examples, images.shape[0])
     for index in range(count):
         image = Image.fromarray(denormalize_image(images[index]), mode="RGB")
         gt = colorize_mask(masks_np[index])
-        pred = colorize_mask(predictions[index])
+        pred = colorize_mask(predictions_np[index])
         width, height = image.size
         panel = Image.new("RGB", (width * 3, height), color=(0, 0, 0))
         panel.paste(image, (0, 0))
@@ -123,29 +138,32 @@ def validate(
     figure_dir: Path,
     epoch: int,
     num_visualizations: int,
+    target_mode: str,
 ) -> dict[str, float]:
     model.eval()
     running_loss = 0.0
-    tracker = SegmentationMetricTracker(ignore_index=IGNORE_ID)
+    tracker = SegmentationMetricTracker(num_classes=NUM_CLASSES + 1, ignore_index=IGNORE_ID)
     prediction_counter: Counter[int] = Counter()
     ground_truth_counter: Counter[int] = Counter()
     saved_visuals = False
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
+        semantic_masks = batch["semantic_mask"].to(device, non_blocking=True)
+        class_ids = batch["class_id"].to(device, non_blocking=True)
         logits = model(images)
         loss = criterion(logits, masks)
         running_loss += float(loss.item())
-        tracker.update(logits, masks)
-        predictions = torch.argmax(logits.detach(), dim=1)
-        ids, counts = torch.unique(predictions.cpu(), return_counts=True)
+        semantic_predictions = semantic_prediction_from_logits(logits, class_ids, target_mode)
+        tracker.update_predictions(semantic_predictions, semantic_masks)
+        ids, counts = torch.unique(semantic_predictions.cpu(), return_counts=True)
         prediction_counter.update({int(mask_id): int(count) for mask_id, count in zip(ids, counts)})
-        update_valid_mask_counter(ground_truth_counter, masks)
+        update_valid_mask_counter(ground_truth_counter, semantic_masks)
         if not saved_visuals and num_visualizations > 0:
             save_prediction_panels(
                 images.cpu(),
-                masks.cpu(),
-                logits.cpu(),
+                semantic_masks.cpu(),
+                semantic_predictions.cpu(),
                 figure_dir,
                 prefix=f"epoch_{epoch:03d}_val",
                 max_examples=num_visualizations,
@@ -201,6 +219,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--background-weight", type=float, default=0.05)
     parser.add_argument("--foreground-weight", type=float, default=1.0)
+    parser.add_argument("--target-mode", choices=["binary", "semantic"], default="binary")
     parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
@@ -216,8 +235,20 @@ def main() -> None:
     use_amp = device.type == "cuda"
     print(f"Using device: {device}; mixed precision: {use_amp}")
 
-    train_dataset = SegmentationDataset(args.data_root, "train_seg", args.image_size, args.max_train_samples)
-    val_dataset = SegmentationDataset(args.data_root, "val", args.image_size, args.max_val_samples)
+    train_dataset = SegmentationDataset(
+        args.data_root,
+        "train_seg",
+        args.image_size,
+        args.target_mode,
+        args.max_train_samples,
+    )
+    val_dataset = SegmentationDataset(
+        args.data_root,
+        "val",
+        args.image_size,
+        args.target_mode,
+        args.max_val_samples,
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -234,8 +265,10 @@ def main() -> None:
     )
     print(f"Train samples: {len(train_dataset)}; val samples: {len(val_dataset)}")
 
-    model = build_segmentation_model(num_classes=301, base_channels=args.base_channels).to(device)
-    class_weights = torch.full((301,), float(args.foreground_weight), dtype=torch.float32, device=device)
+    output_classes = 2 if args.target_mode == "binary" else NUM_CLASSES + 1
+    print(f"Target mode: {args.target_mode}; model output channels: {output_classes}")
+    model = build_segmentation_model(num_classes=output_classes, base_channels=args.base_channels).to(device)
+    class_weights = torch.full((output_classes,), float(args.foreground_weight), dtype=torch.float32, device=device)
     class_weights[0] = float(args.background_weight)
     print(
         "CrossEntropyLoss weights: "
@@ -261,7 +294,16 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, use_amp)
-        val_metrics = validate(model, val_loader, criterion, device, args.figure_dir, epoch, args.num_visualizations)
+        val_metrics = validate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            args.figure_dir,
+            epoch,
+            args.num_visualizations,
+            args.target_mode,
+        )
         scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
         row = {
