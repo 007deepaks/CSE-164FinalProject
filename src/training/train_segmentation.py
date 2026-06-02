@@ -71,6 +71,22 @@ def summarize_prediction_distribution(counter: Counter[int], top_k: int = 10) ->
     ]
 
 
+def update_valid_mask_counter(counter: Counter[int], mask: torch.Tensor) -> None:
+    """Count mask ids, excluding ignore pixels."""
+    valid_mask = mask.detach().cpu()
+    valid_mask = valid_mask[valid_mask != IGNORE_ID]
+    ids, counts = torch.unique(valid_mask, return_counts=True)
+    counter.update({int(mask_id): int(count) for mask_id, count in zip(ids, counts)})
+
+
+def foreground_percentage(counter: Counter[int]) -> float:
+    total = sum(counter.values())
+    if total == 0:
+        return 0.0
+    foreground = sum(count for mask_id, count in counter.items() if mask_id > 0)
+    return 100.0 * foreground / total
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -112,6 +128,7 @@ def validate(
     running_loss = 0.0
     tracker = SegmentationMetricTracker(ignore_index=IGNORE_ID)
     prediction_counter: Counter[int] = Counter()
+    ground_truth_counter: Counter[int] = Counter()
     saved_visuals = False
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
@@ -123,6 +140,7 @@ def validate(
         predictions = torch.argmax(logits.detach(), dim=1)
         ids, counts = torch.unique(predictions.cpu(), return_counts=True)
         prediction_counter.update({int(mask_id): int(count) for mask_id, count in zip(ids, counts)})
+        update_valid_mask_counter(ground_truth_counter, masks)
         if not saved_visuals and num_visualizations > 0:
             save_prediction_panels(
                 images.cpu(),
@@ -135,8 +153,14 @@ def validate(
             saved_visuals = True
     metrics = tracker.compute()
     metrics["loss"] = running_loss / max(1, len(loader))
-    print("  val prediction id distribution:")
+    print("  val foreground pixels:")
+    print(f"    predicted foreground: {foreground_percentage(prediction_counter):6.2f}%")
+    print(f"    ground truth foreground: {foreground_percentage(ground_truth_counter):6.2f}%")
+    print("  val top predicted ids:")
     for mask_id, count, percent in summarize_prediction_distribution(prediction_counter):
+        print(f"    id={mask_id:3d} pixels={count:10d} ({percent:6.2f}%)")
+    print("  val top ground-truth ids:")
+    for mask_id, count, percent in summarize_prediction_distribution(ground_truth_counter):
         print(f"    id={mask_id:3d} pixels={count:10d} ({percent:6.2f}%)")
     return metrics
 
@@ -175,6 +199,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--min-learning-rate", type=float, default=3e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--background-weight", type=float, default=0.05)
+    parser.add_argument("--foreground-weight", type=float, default=1.0)
     parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
@@ -209,7 +235,14 @@ def main() -> None:
     print(f"Train samples: {len(train_dataset)}; val samples: {len(val_dataset)}")
 
     model = build_segmentation_model(num_classes=301, base_channels=args.base_channels).to(device)
-    criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_ID)
+    class_weights = torch.full((301,), float(args.foreground_weight), dtype=torch.float32, device=device)
+    class_weights[0] = float(args.background_weight)
+    print(
+        "CrossEntropyLoss weights: "
+        f"background={class_weights[0].item():g}, "
+        f"foreground={class_weights[1].item():g}"
+    )
+    criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=IGNORE_ID)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler_t_max = max(2, args.epochs)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
