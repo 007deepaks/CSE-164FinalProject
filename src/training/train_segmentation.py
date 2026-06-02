@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -59,6 +60,17 @@ def save_prediction_panels(
         panel.save(output_dir / f"{prefix}_{index:03d}.jpg", quality=95)
 
 
+def summarize_prediction_distribution(counter: Counter[int], top_k: int = 10) -> list[tuple[int, int, float]]:
+    """Return the most common predicted ids as (id, pixels, percent)."""
+    total = sum(counter.values())
+    if total == 0:
+        return []
+    return [
+        (mask_id, count, 100.0 * count / total)
+        for mask_id, count in counter.most_common(top_k)
+    ]
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -99,6 +111,7 @@ def validate(
     model.eval()
     running_loss = 0.0
     tracker = SegmentationMetricTracker(ignore_index=IGNORE_ID)
+    prediction_counter: Counter[int] = Counter()
     saved_visuals = False
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
@@ -107,6 +120,9 @@ def validate(
         loss = criterion(logits, masks)
         running_loss += float(loss.item())
         tracker.update(logits, masks)
+        predictions = torch.argmax(logits.detach(), dim=1)
+        ids, counts = torch.unique(predictions.cpu(), return_counts=True)
+        prediction_counter.update({int(mask_id): int(count) for mask_id, count in zip(ids, counts)})
         if not saved_visuals and num_visualizations > 0:
             save_prediction_panels(
                 images.cpu(),
@@ -119,6 +135,9 @@ def validate(
             saved_visuals = True
     metrics = tracker.compute()
     metrics["loss"] = running_loss / max(1, len(loader))
+    print("  val prediction id distribution:")
+    for mask_id, count, percent in summarize_prediction_distribution(prediction_counter):
+        print(f"    id={mask_id:3d} pixels={count:10d} ({percent:6.2f}%)")
     return metrics
 
 
@@ -154,6 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--min-learning-rate", type=float, default=3e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--max-train-samples", type=int)
@@ -191,7 +211,16 @@ def main() -> None:
     model = build_segmentation_model(num_classes=301, base_channels=args.base_channels).to(device)
     criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_ID)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
+    scheduler_t_max = max(2, args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=scheduler_t_max,
+        eta_min=args.min_learning_rate,
+    )
+    print(
+        "Scheduler: CosineAnnealingLR "
+        f"T_max={scheduler_t_max}, eta_min={args.min_learning_rate:g}"
+    )
     scaler = GradScaler(enabled=use_amp)
     best_miou = -1.0
 
