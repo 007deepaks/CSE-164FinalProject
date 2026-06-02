@@ -182,3 +182,41 @@ For a binary checkpoint, test-time semantic ids require a class source. Until a
 classifier is added, `predict_test.py` uses `--default-class-id 0`, which keeps
 the CSV valid but is not a strong final test strategy. Later, pass a CSV with
 `image,class_id` using `--class-csv`.
+
+## First Classification Baseline
+
+This baseline trains a small ConvNeXt-style classifier from scratch for the 300
+image-level classes. It uses a patch stem, depthwise convolution blocks,
+LayerNorm, GELU, residual connections, global average pooling, and a linear
+classifier. No pretrained weights are used.
+
+Quick smoke training run:
+
+```powershell
+python -m src.training.train_classification --data-root data/raw --epochs 1 --batch-size 2 --base-channels 16 --depths 1,1,1,1 --max-train-samples 8 --max-val-samples 8
+```
+
+Normal first classifier run:
+
+```powershell
+python -m src.training.train_classification --data-root data/raw --epochs 20 --batch-size 32 --base-channels 48 --depths 2,2,4,2
+```
+
+Evaluate the best classifier checkpoint:
+
+```powershell
+python -m src.training.evaluate_classification --checkpoint outputs/checkpoints/best_classification.pt --data-root data/raw
+```
+
+Predict test image classes:
+
+```powershell
+python -m src.training.predict_classification --checkpoint outputs/checkpoints/best_classification.pt --data-root data/raw --output outputs/predictions/test_class_predictions.csv
+```
+
+Generate a segmentation submission using a binary segmentation checkpoint and
+classifier class predictions:
+
+```powershell
+python -m src.training.predict_test --checkpoint outputs/checkpoints/best_segmentation.pt --data-root data/raw --class-csv outputs/predictions/test_class_predictions.csv --output outputs/submissions/submission.csv
+```
