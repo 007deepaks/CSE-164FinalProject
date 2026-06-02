@@ -27,11 +27,12 @@ data/processed/
 data/interim/
 
 # Model outputs and experiment artifacts
-outputs/
 runs/
 wandb/
 mlruns/
 checkpoints/
+outputs/checkpoints/*
+!outputs/checkpoints/.gitkeep
 *.pt
 *.pth
 *.ckpt
