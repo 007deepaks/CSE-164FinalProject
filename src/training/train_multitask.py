@@ -242,6 +242,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("outputs/checkpoints"))
     parser.add_argument(
+        "--no-random-crop",
+        action="store_true",
+        help="Disable random resized crop while keeping flip/color jitter augmentations.",
+    )
+    parser.add_argument(
         "--debug-overfit",
         action="store_true",
         help="Overfit 8 segmentation and 32 classification samples with augmentation disabled.",
@@ -259,6 +264,7 @@ def main() -> None:
         args.label_smoothing = 0.0
         args.weight_decay = 0.0
         args.drop_path = 0.0
+        args.no_random_crop = True
         args.min_learning_rate = min(args.min_learning_rate, args.learning_rate)
         print("DEBUG OVERFIT: using 8 segmentation samples, 32 classification samples, no augmentation.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -279,6 +285,7 @@ def main() -> None:
         target_mode="binary",
         max_samples=args.max_seg_samples,
         augment=not args.debug_overfit,
+        random_crop=not args.no_random_crop,
     )
     cls_train = ClassificationDataset(
         args.data_root,
@@ -286,6 +293,7 @@ def main() -> None:
         image_size=args.image_size,
         max_samples=args.max_cls_samples,
         augment=not args.debug_overfit,
+        random_crop=not args.no_random_crop,
     )
     val_dataset = SegmentationDataset(
         args.data_root,
@@ -404,6 +412,8 @@ def main() -> None:
             f"val_auto={row['automated_score']:.4f} "
             f"val_seg={row['segmentation_score']:.4f} "
             f"mIoU={row['mean_iou']:.4f} "
+            f"bin_iou={row['binary_foreground_iou']:.4f} "
+            f"oracle_mIoU={row['oracle_semantic_miou']:.4f} "
             f"boundary={row['boundary_f_score']:.4f} "
             f"rare_mIoU={row['rare_class_miou']:.4f} "
             f"macro_acc={row['classification_macro_accuracy']:.4f} "

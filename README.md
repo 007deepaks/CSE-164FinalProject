@@ -159,6 +159,18 @@ Recommended 1x V100 run:
 python -m src.training.train_multitask --data-root data/raw --epochs 40 --image-size 320 --model-size small --seg-batch-size 2 --cls-batch-size 16 --num-workers 4
 ```
 
+If early full runs stay near random, try this lower-risk diagnostic training
+run before scaling back up:
+
+```powershell
+python -m src.training.train_multitask --data-root data/raw --epochs 20 --image-size 320 --model-size tiny --seg-batch-size 4 --cls-batch-size 32 --num-workers 4 --learning-rate 1e-3 --weight-decay 1e-4 --drop-path 0.0 --no-random-crop --seg-classification-loss-weight 1.0 --cls-loss-weight 1.0
+```
+
+Watch `bin_iou` and `oracle_mIoU` separately from `mIoU`. If they rise while
+`mIoU` stays low, segmentation shape is learning and classification is the
+bottleneck. If all three stay flat, inspect masks, foreground percentage, and
+loss behavior before another long run.
+
 Training uses synchronized random resized crop and horizontal flip for
 segmentation images/masks, image-only color jitter/blur, AMP on CUDA, AdamW,
 cosine LR decay, weighted segmentation CE, Dice loss, and classification CE

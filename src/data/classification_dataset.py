@@ -33,6 +33,7 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         image_size: int = DEFAULT_IMAGE_SIZE,
         max_samples: int | None = None,
         augment: bool = False,
+        random_crop: bool = True,
     ) -> None:
         if split not in {"train_labeled", "val", "test"}:
             raise ValueError("split must be 'train_labeled', 'val', or 'test'")
@@ -40,6 +41,7 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         self.split = split
         self.image_size = image_size
         self.augment = augment
+        self.random_crop = random_crop
         self.samples = self._load_samples()
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
@@ -86,7 +88,7 @@ class ClassificationDataset(Dataset[dict[str, object]]):
             image = image.convert("RGB")
             original_size = image.size
             image_tensor = (
-                augment_image_to_tensor(image, self.image_size)
+                augment_image_to_tensor(image, self.image_size, self.random_crop)
                 if self.augment
                 else image_to_tensor(image, self.image_size)
             )

@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from starter.kaggle_metric import detailed_score, encode_mask_ids
 from src.metrics.classification_metrics import ClassificationMetricTracker
 from src.models.multitask_model import build_multitask_model
-from src.utils.masks import NUM_CLASSES, decode_rgb_mask, encode_mask_to_rle, validate_prediction_mask
+from src.utils.masks import IGNORE_ID, NUM_CLASSES, decode_rgb_mask, encode_mask_to_rle, validate_prediction_mask
 
 
 def args_to_dict(args: argparse.Namespace) -> dict[str, object]:
@@ -102,14 +102,46 @@ def validate_multitask(
     loss_batches = 0
     class_tracker = ClassificationMetricTracker(num_classes=NUM_CLASSES)
     submission_rows: list[dict[str, object]] = []
+    binary_intersection = 0
+    binary_union = 0
+    binary_correct_pixels = 0
+    binary_valid_pixels = 0
+    oracle_intersections = np.zeros(NUM_CLASSES + 1, dtype=np.float64)
+    oracle_unions = np.zeros(NUM_CLASSES + 1, dtype=np.float64)
+    predicted_foreground_pixels = 0
+    target_foreground_pixels = 0
 
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
+        semantic_masks = batch["semantic_mask"].to(device, non_blocking=True)
         class_ids = batch["class_id"].to(device, non_blocking=True)
         outputs = model(images)
         segmentation_logits = outputs["segmentation"]
         classification_logits = outputs["classification"]
+        binary_predictions = torch.argmax(segmentation_logits, dim=1)
+        valid = masks != IGNORE_ID
+        pred_fg = (binary_predictions == 1) & valid
+        target_fg = (masks == 1) & valid
+        binary_intersection += int((pred_fg & target_fg).sum().item())
+        binary_union += int((pred_fg | target_fg).sum().item())
+        binary_correct_pixels += int(((binary_predictions == masks) & valid).sum().item())
+        binary_valid_pixels += int(valid.sum().item())
+        predicted_foreground_pixels += int(pred_fg.sum().item())
+        target_foreground_pixels += int(target_fg.sum().item())
+
+        oracle_semantic = torch.zeros_like(binary_predictions)
+        oracle_ids = (class_ids.long() + 1).view(-1, 1, 1)
+        oracle_semantic = torch.where(binary_predictions == 1, oracle_ids.expand_as(binary_predictions), oracle_semantic)
+        valid_semantic = semantic_masks != IGNORE_ID
+        for segmentation_id in torch.unique(semantic_masks[valid_semantic]).detach().cpu().tolist():
+            segmentation_id = int(segmentation_id)
+            if segmentation_id <= 0:
+                continue
+            pred_class = (oracle_semantic == segmentation_id) & valid_semantic
+            target_class = (semantic_masks == segmentation_id) & valid_semantic
+            oracle_intersections[segmentation_id] += float((pred_class & target_class).sum().item())
+            oracle_unions[segmentation_id] += float((pred_class | target_class).sum().item())
 
         if segmentation_criterion is not None:
             running_segmentation_loss += float(segmentation_criterion(segmentation_logits, masks).item())
@@ -141,8 +173,15 @@ def validate_multitask(
     solution = build_val_solution_frame(data_root, set(submission["image"].astype(str)))
     metrics = detailed_score(solution, submission)
     classification_metrics = class_tracker.compute()
+    oracle_present = oracle_unions > 0
+    oracle_miou = float(np.mean(oracle_intersections[oracle_present] / oracle_unions[oracle_present])) if oracle_present.any() else 0.0
     metrics["accuracy"] = classification_metrics["accuracy"]
     metrics["macro_accuracy_observed"] = classification_metrics["macro_accuracy"]
+    metrics["binary_foreground_iou"] = binary_intersection / max(1, binary_union)
+    metrics["binary_pixel_accuracy"] = binary_correct_pixels / max(1, binary_valid_pixels)
+    metrics["oracle_semantic_miou"] = oracle_miou
+    metrics["predicted_foreground_pct"] = 100.0 * predicted_foreground_pixels / max(1, binary_valid_pixels)
+    metrics["target_foreground_pct"] = 100.0 * target_foreground_pixels / max(1, binary_valid_pixels)
     metrics["segmentation_loss"] = running_segmentation_loss / max(1, loss_batches)
     metrics["classification_loss"] = running_classification_loss / max(1, loss_batches)
     return {key: float(value) for key, value in metrics.items()}

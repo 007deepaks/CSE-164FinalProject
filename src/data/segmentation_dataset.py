@@ -86,12 +86,17 @@ def _jitter_image(image: Image.Image) -> Image.Image:
     return image
 
 
-def augment_image_to_tensor(image: Image.Image, image_size: int = DEFAULT_IMAGE_SIZE) -> torch.Tensor:
+def augment_image_to_tensor(
+    image: Image.Image,
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    random_crop: bool = True,
+) -> torch.Tensor:
     """Apply image-only training augmentation and return a normalized tensor."""
     image = image.convert("RGB")
-    width, height = image.size
-    left, top, crop_width, crop_height = _random_resized_crop_params(width, height)
-    image = image.crop((left, top, left + crop_width, top + crop_height))
+    if random_crop:
+        width, height = image.size
+        left, top, crop_width, crop_height = _random_resized_crop_params(width, height)
+        image = image.crop((left, top, left + crop_width, top + crop_height))
     image = image.resize((image_size, image_size), Image.Resampling.BILINEAR)
     if random.random() < 0.5:
         image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
@@ -103,15 +108,17 @@ def augment_image_and_mask_to_tensors(
     image: Image.Image,
     mask: np.ndarray,
     image_size: int = DEFAULT_IMAGE_SIZE,
+    random_crop: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply synchronized crop/flip to image and mask, with jitter on image only."""
     image = image.convert("RGB")
     mask_image = Image.fromarray(mask.astype(np.int32), mode="I")
-    width, height = image.size
-    left, top, crop_width, crop_height = _random_resized_crop_params(width, height)
-    crop_box = (left, top, left + crop_width, top + crop_height)
-    image = image.crop(crop_box)
-    mask_image = mask_image.crop(crop_box)
+    if random_crop:
+        width, height = image.size
+        left, top, crop_width, crop_height = _random_resized_crop_params(width, height)
+        crop_box = (left, top, left + crop_width, top + crop_height)
+        image = image.crop(crop_box)
+        mask_image = mask_image.crop(crop_box)
     image = image.resize((image_size, image_size), Image.Resampling.BILINEAR)
     mask_image = mask_image.resize((image_size, image_size), Image.Resampling.NEAREST)
     if random.random() < 0.5:
@@ -140,6 +147,7 @@ class SegmentationDataset(Dataset[dict[str, object]]):
         target_mode: str = "binary",
         max_samples: int | None = None,
         augment: bool = False,
+        random_crop: bool = True,
     ) -> None:
         if split not in {"train_seg", "val"}:
             raise ValueError("split must be 'train_seg' or 'val'")
@@ -150,6 +158,7 @@ class SegmentationDataset(Dataset[dict[str, object]]):
         self.image_size = image_size
         self.target_mode = target_mode
         self.augment = augment
+        self.random_crop = random_crop
         self.samples = self._load_samples()
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
@@ -197,6 +206,7 @@ class SegmentationDataset(Dataset[dict[str, object]]):
                 image,
                 semantic_mask_array,
                 self.image_size,
+                self.random_crop,
             )
         else:
             image_tensor = image_to_tensor(image, self.image_size)
