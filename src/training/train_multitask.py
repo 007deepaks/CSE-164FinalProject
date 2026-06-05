@@ -48,6 +48,7 @@ def train_segmentation_batches(
         "segmentation_dice_loss": 0.0,
         "segmentation_classification_loss": 0.0,
         "segmentation_total_loss": 0.0,
+        "segmentation_skipped_batches": 0.0,
     }
     for batch_index, batch in enumerate(loader, start=1):
         images = batch["image"].to(device, non_blocking=True)
@@ -57,17 +58,34 @@ def train_segmentation_batches(
         with autocast(device_type="cuda", enabled=use_amp):
             outputs = model(images)
             ce = segmentation_criterion(outputs["segmentation"], masks)
-            dice = dice_loss(outputs["segmentation"], masks)
             class_loss = classification_criterion(outputs["classification"], class_ids)
-            loss = (
-                segmentation_loss_weight * ce
-                + dice_loss_weight * dice
-                + seg_classification_loss_weight * class_loss
-            )
+        dice = dice_loss(outputs["segmentation"].float(), masks)
+        loss = (
+            segmentation_loss_weight * ce
+            + dice_loss_weight * dice
+            + seg_classification_loss_weight * class_loss
+        )
+        components = {
+            "ce": ce,
+            "dice": dice,
+            "class_loss": class_loss,
+            "loss": loss,
+        }
+        bad_components = [name for name, value in components.items() if not torch.isfinite(value.detach()).all()]
+        if bad_components:
+            totals["segmentation_skipped_batches"] += 1.0
+            print(f"  WARNING: skipping seg batch {batch_index:04d}; non-finite {bad_components}")
+            continue
         scaler.scale(loss).backward()
         if gradient_clip > 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+            if not torch.isfinite(grad_norm):
+                totals["segmentation_skipped_batches"] += 1.0
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                print(f"  WARNING: skipping seg batch {batch_index:04d}; non-finite grad_norm")
+                continue
         scaler.step(optimizer)
         scaler.update()
 
@@ -77,7 +95,11 @@ def train_segmentation_batches(
         totals["segmentation_total_loss"] += float(loss.item())
         if batch_index % 20 == 0 or batch_index == len(loader):
             print(f"  seg batch {batch_index:04d}/{len(loader)} loss={loss.item():.4f}")
-    return {key: value / max(1, len(loader)) for key, value in totals.items()}
+    divisor = max(1, len(loader) - int(totals["segmentation_skipped_batches"]))
+    return {
+        key: (value / divisor if key != "segmentation_skipped_batches" else value)
+        for key, value in totals.items()
+    }
 
 
 def train_classification_batches(
@@ -90,9 +112,13 @@ def train_classification_batches(
     use_amp: bool,
     cls_loss_weight: float,
     gradient_clip: float,
+    metric_prefix: str = "classification_train",
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
+    correct = 0
+    total = 0
+    skipped_batches = 0
     for batch_index, batch in enumerate(loader, start=1):
         images = batch["image"].to(device, non_blocking=True)
         class_ids = batch["class_id"].to(device, non_blocking=True)
@@ -101,16 +127,34 @@ def train_classification_batches(
             outputs = model(images)
             raw_loss = classification_criterion(outputs["classification"], class_ids)
             loss = cls_loss_weight * raw_loss
+        if not torch.isfinite(raw_loss.detach()).all() or not torch.isfinite(loss.detach()).all():
+            skipped_batches += 1
+            print(f"  WARNING: skipping cls batch {batch_index:04d}; non-finite loss")
+            continue
         scaler.scale(loss).backward()
         if gradient_clip > 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+            if not torch.isfinite(grad_norm):
+                skipped_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                print(f"  WARNING: skipping cls batch {batch_index:04d}; non-finite grad_norm")
+                continue
         scaler.step(optimizer)
         scaler.update()
         total_loss += float(raw_loss.item())
+        predictions = torch.argmax(outputs["classification"].detach(), dim=1)
+        correct += int((predictions == class_ids).sum().item())
+        total += int(class_ids.numel())
         if batch_index % 20 == 0 or batch_index == len(loader):
             print(f"  cls batch {batch_index:04d}/{len(loader)} loss={raw_loss.item():.4f}")
-    return {"classification_train_loss": total_loss / max(1, len(loader))}
+    divisor = max(1, len(loader) - skipped_batches)
+    return {
+        f"{metric_prefix}_loss": total_loss / divisor,
+        f"{metric_prefix}_accuracy": correct / max(1, total),
+        f"{metric_prefix}_skipped_batches": float(skipped_batches),
+    }
 
 
 @torch.no_grad()
@@ -211,6 +255,12 @@ def save_checkpoint(
     )
 
 
+def load_model_weights(path: Path, model: nn.Module, device: torch.device) -> None:
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    print(f"Loaded model weights from {path}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, default=Path("data/raw"))
@@ -224,6 +274,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-learning-rate", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=5e-2)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--stage", choices=["classifier_warmup", "joint"], default="joint")
+    parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--background-weight", type=float, default=0.05)
     parser.add_argument("--foreground-weight", type=float, default=1.0)
     parser.add_argument("--segmentation-loss-weight", type=float, default=1.0)
@@ -337,6 +389,8 @@ def main() -> None:
         drop_path=args.drop_path,
         decoder_channels=args.decoder_channels,
     ).to(device)
+    if args.resume_checkpoint is not None:
+        load_model_weights(args.resume_checkpoint, model, device)
     seg_weights = torch.tensor(
         [args.background_weight, args.foreground_weight],
         dtype=torch.float32,
@@ -353,23 +407,50 @@ def main() -> None:
     scaler = GradScaler(enabled=use_amp)
     best_score = -1.0
     history: list[dict[str, float]] = []
+    print(f"Training stage: {args.stage}")
 
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
-        seg_metrics = train_segmentation_batches(
-            model,
-            seg_loader,
-            segmentation_criterion,
-            classification_criterion,
-            optimizer,
-            device,
-            scaler,
-            use_amp,
-            args.segmentation_loss_weight,
-            args.dice_loss_weight,
-            args.seg_classification_loss_weight,
-            args.gradient_clip,
-        )
+        if args.stage == "classifier_warmup":
+            seg_metrics = {
+                "segmentation_ce_loss": 0.0,
+                "segmentation_dice_loss": 0.0,
+                "segmentation_classification_loss": 0.0,
+                "segmentation_total_loss": 0.0,
+                "segmentation_skipped_batches": 0.0,
+            }
+            seg_cls_metrics = train_classification_batches(
+                model,
+                seg_loader,
+                classification_criterion,
+                optimizer,
+                device,
+                scaler,
+                use_amp,
+                args.seg_classification_loss_weight,
+                args.gradient_clip,
+                metric_prefix="seg_classification_train",
+            )
+        else:
+            seg_metrics = train_segmentation_batches(
+                model,
+                seg_loader,
+                segmentation_criterion,
+                classification_criterion,
+                optimizer,
+                device,
+                scaler,
+                use_amp,
+                args.segmentation_loss_weight,
+                args.dice_loss_weight,
+                args.seg_classification_loss_weight,
+                args.gradient_clip,
+            )
+            seg_cls_metrics = {
+                "seg_classification_train_loss": seg_metrics["segmentation_classification_loss"],
+                "seg_classification_train_accuracy": 0.0,
+                "seg_classification_train_skipped_batches": 0.0,
+            }
         cls_metrics = train_classification_batches(
             model,
             cls_loader,
@@ -380,6 +461,7 @@ def main() -> None:
             use_amp,
             args.cls_loss_weight,
             args.gradient_clip,
+            metric_prefix="classification_train",
         )
         val_metrics = validate_multitask(
             model,
@@ -399,6 +481,7 @@ def main() -> None:
         row = {
             "epoch": float(epoch),
             **seg_metrics,
+            **seg_cls_metrics,
             **cls_metrics,
             **val_metrics,
             **debug_metrics,
@@ -409,6 +492,8 @@ def main() -> None:
             "  "
             f"seg_loss={row['segmentation_total_loss']:.4f} "
             f"cls_loss={row['classification_train_loss']:.4f} "
+            f"train_cls_acc={row['classification_train_accuracy']:.4f} "
+            f"train_seg_cls_acc={row['seg_classification_train_accuracy']:.4f} "
             f"val_auto={row['automated_score']:.4f} "
             f"val_seg={row['segmentation_score']:.4f} "
             f"mIoU={row['mean_iou']:.4f} "
@@ -439,8 +524,13 @@ def main() -> None:
             best_score,
             args,
         )
-        if row["automated_score"] > best_score:
-            best_score = row["automated_score"]
+        selection_metric = (
+            row["classification_macro_accuracy"]
+            if args.stage == "classifier_warmup"
+            else row["automated_score"]
+        )
+        if selection_metric > best_score:
+            best_score = selection_metric
             save_checkpoint(
                 args.checkpoint_dir / "best_multitask.pt",
                 model,
@@ -450,7 +540,7 @@ def main() -> None:
                 best_score,
                 args,
             )
-            print(f"  saved new best checkpoint with automated_score={best_score:.4f}")
+            print(f"  saved new best checkpoint with selection_metric={best_score:.4f}")
 
     history_path = args.checkpoint_dir / "multitask_history.json"
     history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")

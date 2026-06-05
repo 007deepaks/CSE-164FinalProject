@@ -171,6 +171,21 @@ Watch `bin_iou` and `oracle_mIoU` separately from `mIoU`. If they rise while
 bottleneck. If all three stay flat, inspect masks, foreground percentage, and
 loss behavior before another long run.
 
+Classifier-first warmup, then joint fine-tuning:
+
+```powershell
+python -m src.training.train_multitask --data-root data/raw --stage classifier_warmup --epochs 30 --image-size 320 --model-size tiny --seg-batch-size 8 --cls-batch-size 32 --num-workers 4 --learning-rate 3e-4 --weight-decay 1e-4 --drop-path 0.0 --no-random-crop --label-smoothing 0.0 --seg-classification-loss-weight 1.0 --cls-loss-weight 1.0 --checkpoint-dir outputs/checkpoints/classifier_warmup
+```
+
+```powershell
+python -m src.training.train_multitask --data-root data/raw --stage joint --resume-checkpoint outputs/checkpoints/classifier_warmup/best_multitask.pt --epochs 30 --image-size 320 --model-size tiny --seg-batch-size 4 --cls-batch-size 32 --num-workers 4 --learning-rate 1e-4 --weight-decay 1e-4 --drop-path 0.0 --no-random-crop --seg-classification-loss-weight 1.0 --cls-loss-weight 1.0 --checkpoint-dir outputs/checkpoints/joint_from_warmup
+```
+
+The warmup stage trains classification on both `train_labeled` and `train_seg`
+class labels, leaves segmentation loss off, and saves best by validation macro
+accuracy. The joint stage resumes those weights and saves best by automated
+validation score. Non-finite losses or gradients are reported and skipped.
+
 Training uses synchronized random resized crop and horizontal flip for
 segmentation images/masks, image-only color jitter/blur, AMP on CUDA, AdamW,
 cosine LR decay, weighted segmentation CE, Dice loss, and classification CE
