@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from torch.utils.data import Dataset
 
 from src.utils.masks import decode_rgb_mask
@@ -30,12 +31,17 @@ def _read_json(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def image_to_tensor(image: Image.Image, image_size: int = DEFAULT_IMAGE_SIZE) -> torch.Tensor:
-    """Resize an RGB image and convert it to a normalized CHW float tensor."""
-    image = image.convert("RGB").resize((image_size, image_size), Image.Resampling.BILINEAR)
+def _normalize_image(image: Image.Image) -> torch.Tensor:
+    """Convert an already-sized RGB image to a normalized CHW float tensor."""
     array = np.asarray(image, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1)
     return (tensor - IMAGE_MEAN) / IMAGE_STD
+
+
+def image_to_tensor(image: Image.Image, image_size: int = DEFAULT_IMAGE_SIZE) -> torch.Tensor:
+    """Resize an RGB image and convert it to a normalized CHW float tensor."""
+    image = image.convert("RGB").resize((image_size, image_size), Image.Resampling.BILINEAR)
+    return _normalize_image(image)
 
 
 def mask_to_tensor(mask_path: Path, image_size: int = DEFAULT_IMAGE_SIZE) -> torch.Tensor:
@@ -44,6 +50,75 @@ def mask_to_tensor(mask_path: Path, image_size: int = DEFAULT_IMAGE_SIZE) -> tor
     mask_image = Image.fromarray(mask, mode="I")
     mask_image = mask_image.resize((image_size, image_size), Image.Resampling.NEAREST)
     return torch.from_numpy(np.asarray(mask_image, dtype=np.int64))
+
+
+def _mask_image_to_tensor(mask_image: Image.Image) -> torch.Tensor:
+    return torch.from_numpy(np.asarray(mask_image, dtype=np.int64))
+
+
+def _random_resized_crop_params(width: int, height: int) -> tuple[int, int, int, int]:
+    area = width * height
+    for _ in range(10):
+        target_area = random.uniform(0.55, 1.0) * area
+        aspect_ratio = random.uniform(0.75, 1.3333333333)
+        crop_width = int(round((target_area * aspect_ratio) ** 0.5))
+        crop_height = int(round((target_area / aspect_ratio) ** 0.5))
+        if 0 < crop_width <= width and 0 < crop_height <= height:
+            left = random.randint(0, width - crop_width)
+            top = random.randint(0, height - crop_height)
+            return left, top, crop_width, crop_height
+
+    crop_size = min(width, height)
+    left = (width - crop_size) // 2
+    top = (height - crop_size) // 2
+    return left, top, crop_size, crop_size
+
+
+def _jitter_image(image: Image.Image) -> Image.Image:
+    brightness = random.uniform(0.75, 1.25)
+    contrast = random.uniform(0.75, 1.25)
+    color = random.uniform(0.85, 1.15)
+    image = ImageEnhance.Brightness(image).enhance(brightness)
+    image = ImageEnhance.Contrast(image).enhance(contrast)
+    image = ImageEnhance.Color(image).enhance(color)
+    if random.random() < 0.10:
+        image = image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 0.8)))
+    return image
+
+
+def augment_image_to_tensor(image: Image.Image, image_size: int = DEFAULT_IMAGE_SIZE) -> torch.Tensor:
+    """Apply image-only training augmentation and return a normalized tensor."""
+    image = image.convert("RGB")
+    width, height = image.size
+    left, top, crop_width, crop_height = _random_resized_crop_params(width, height)
+    image = image.crop((left, top, left + crop_width, top + crop_height))
+    image = image.resize((image_size, image_size), Image.Resampling.BILINEAR)
+    if random.random() < 0.5:
+        image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    image = _jitter_image(image)
+    return _normalize_image(image)
+
+
+def augment_image_and_mask_to_tensors(
+    image: Image.Image,
+    mask: np.ndarray,
+    image_size: int = DEFAULT_IMAGE_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply synchronized crop/flip to image and mask, with jitter on image only."""
+    image = image.convert("RGB")
+    mask_image = Image.fromarray(mask.astype(np.int32), mode="I")
+    width, height = image.size
+    left, top, crop_width, crop_height = _random_resized_crop_params(width, height)
+    crop_box = (left, top, left + crop_width, top + crop_height)
+    image = image.crop(crop_box)
+    mask_image = mask_image.crop(crop_box)
+    image = image.resize((image_size, image_size), Image.Resampling.BILINEAR)
+    mask_image = mask_image.resize((image_size, image_size), Image.Resampling.NEAREST)
+    if random.random() < 0.5:
+        image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        mask_image = mask_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    image = _jitter_image(image)
+    return _normalize_image(image), _mask_image_to_tensor(mask_image)
 
 
 def semantic_to_binary_mask(semantic_mask: torch.Tensor) -> torch.Tensor:
@@ -64,6 +139,7 @@ class SegmentationDataset(Dataset[dict[str, object]]):
         image_size: int = DEFAULT_IMAGE_SIZE,
         target_mode: str = "binary",
         max_samples: int | None = None,
+        augment: bool = False,
     ) -> None:
         if split not in {"train_seg", "val"}:
             raise ValueError("split must be 'train_seg' or 'val'")
@@ -73,6 +149,7 @@ class SegmentationDataset(Dataset[dict[str, object]]):
         self.split = split
         self.image_size = image_size
         self.target_mode = target_mode
+        self.augment = augment
         self.samples = self._load_samples()
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
@@ -110,11 +187,22 @@ class SegmentationDataset(Dataset[dict[str, object]]):
     def __getitem__(self, index: int) -> dict[str, object]:
         sample = self.samples[index]
         with Image.open(sample.image_path) as image:
-            image_tensor = image_to_tensor(image, self.image_size)
+            image = image.convert("RGB")
             original_size = image.size
         if sample.mask_path is None:
             raise ValueError("SegmentationDataset requires masks")
-        semantic_mask = mask_to_tensor(sample.mask_path, self.image_size)
+        semantic_mask_array = decode_rgb_mask(sample.mask_path).astype(np.int32)
+        if self.augment:
+            image_tensor, semantic_mask = augment_image_and_mask_to_tensors(
+                image,
+                semantic_mask_array,
+                self.image_size,
+            )
+        else:
+            image_tensor = image_to_tensor(image, self.image_size)
+            mask_image = Image.fromarray(semantic_mask_array, mode="I")
+            mask_image = mask_image.resize((self.image_size, self.image_size), Image.Resampling.NEAREST)
+            semantic_mask = _mask_image_to_tensor(mask_image)
         mask_tensor = semantic_to_binary_mask(semantic_mask) if self.target_mode == "binary" else semantic_mask
         return {
             "image": image_tensor,

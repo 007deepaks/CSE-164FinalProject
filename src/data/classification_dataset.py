@@ -9,7 +9,7 @@ from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset
 
-from src.data.segmentation_dataset import DEFAULT_IMAGE_SIZE, image_to_tensor
+from src.data.segmentation_dataset import DEFAULT_IMAGE_SIZE, augment_image_to_tensor, image_to_tensor
 
 
 @dataclass(frozen=True)
@@ -32,12 +32,14 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         split: str = "train_labeled",
         image_size: int = DEFAULT_IMAGE_SIZE,
         max_samples: int | None = None,
+        augment: bool = False,
     ) -> None:
         if split not in {"train_labeled", "val", "test"}:
             raise ValueError("split must be 'train_labeled', 'val', or 'test'")
         self.data_root = Path(data_root)
         self.split = split
         self.image_size = image_size
+        self.augment = augment
         self.samples = self._load_samples()
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
@@ -81,8 +83,13 @@ class ClassificationDataset(Dataset[dict[str, object]]):
     def __getitem__(self, index: int) -> dict[str, object]:
         sample = self.samples[index]
         with Image.open(sample.image_path) as image:
-            image_tensor = image_to_tensor(image, self.image_size)
+            image = image.convert("RGB")
             original_size = image.size
+            image_tensor = (
+                augment_image_to_tensor(image, self.image_size)
+                if self.augment
+                else image_to_tensor(image, self.image_size)
+            )
 
         item: dict[str, object] = {
             "image": image_tensor,

@@ -33,6 +33,12 @@ mlruns/
 checkpoints/
 outputs/checkpoints/*
 !outputs/checkpoints/.gitkeep
+outputs/figures/*
+!outputs/figures/.gitkeep
+outputs/predictions/*
+!outputs/predictions/.gitkeep
+outputs/submissions/*
+!outputs/submissions/.gitkeep
 *.pt
 *.pth
 *.ckpt

@@ -1,0 +1,160 @@
+"""Shared utilities for the ConvNeXt multi-task training pipeline."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from PIL import Image
+from torch import nn
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+
+from starter.kaggle_metric import detailed_score, encode_mask_ids
+from src.metrics.classification_metrics import ClassificationMetricTracker
+from src.models.multitask_model import build_multitask_model
+from src.utils.masks import NUM_CLASSES, decode_rgb_mask, encode_mask_to_rle, validate_prediction_mask
+
+
+def args_to_dict(args: argparse.Namespace) -> dict[str, object]:
+    return {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+
+
+def checkpoint_model_kwargs(saved_args: dict[str, object]) -> dict[str, object]:
+    return {
+        "model_size": str(saved_args.get("model_size", "small")),
+        "base_channels": _optional_int(saved_args.get("base_channels")),
+        "depths": _optional_str(saved_args.get("depths")),
+        "mlp_ratio": int(saved_args.get("mlp_ratio", 4)),
+        "drop_path": float(saved_args.get("drop_path", 0.0)),
+        "decoder_channels": _optional_int(saved_args.get("decoder_channels")),
+    }
+
+
+def load_multitask_checkpoint(
+    checkpoint_path: Path,
+    device: torch.device,
+) -> tuple[nn.Module, dict[str, object], dict[str, object]]:
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    saved_args = checkpoint.get("args", {})
+    model = build_multitask_model(**checkpoint_model_kwargs(saved_args)).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model, checkpoint, saved_args
+
+
+def build_val_solution_frame(data_root: Path, image_names: set[str] | None = None) -> pd.DataFrame:
+    class_rows = pd.read_json(data_root / "val" / "classification.json")
+    class_by_image = {str(row.image): int(row.class_id) for row in class_rows.itertuples(index=False)}
+    rows: list[dict[str, object]] = []
+    for image_path in sorted((data_root / "val" / "images").glob("*.JPEG")):
+        if image_names is not None and image_path.name not in image_names:
+            continue
+        mask_path = data_root / "val" / "masks" / image_path.with_suffix(".png").name
+        with Image.open(image_path) as image:
+            width, height = image.size
+        rows.append(
+            {
+                "image": image_path.name,
+                "height": height,
+                "width": width,
+                "class_id": class_by_image[image_path.name],
+                "segmentation_rle": encode_mask_ids(decode_rgb_mask(mask_path)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def semantic_mask_from_logits(
+    segmentation_logits: torch.Tensor,
+    classification_logits: torch.Tensor,
+    index: int,
+    height: int,
+    width: int,
+) -> tuple[np.ndarray, int]:
+    resized_logits = F.interpolate(
+        segmentation_logits[index : index + 1],
+        size=(height, width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    binary_prediction = torch.argmax(resized_logits, dim=1).squeeze(0).cpu().numpy()
+    class_id = int(torch.argmax(classification_logits[index]).detach().cpu().item())
+    mask = np.where(binary_prediction == 1, class_id + 1, 0).astype(np.uint16)
+    validate_prediction_mask(mask)
+    return mask, class_id
+
+
+@torch.no_grad()
+def validate_multitask(
+    model: nn.Module,
+    loader: DataLoader,
+    data_root: Path,
+    device: torch.device,
+    segmentation_criterion: nn.Module | None = None,
+    classification_criterion: nn.Module | None = None,
+) -> dict[str, float]:
+    model.eval()
+    running_segmentation_loss = 0.0
+    running_classification_loss = 0.0
+    loss_batches = 0
+    class_tracker = ClassificationMetricTracker(num_classes=NUM_CLASSES)
+    submission_rows: list[dict[str, object]] = []
+
+    for batch in loader:
+        images = batch["image"].to(device, non_blocking=True)
+        masks = batch["mask"].to(device, non_blocking=True)
+        class_ids = batch["class_id"].to(device, non_blocking=True)
+        outputs = model(images)
+        segmentation_logits = outputs["segmentation"]
+        classification_logits = outputs["classification"]
+
+        if segmentation_criterion is not None:
+            running_segmentation_loss += float(segmentation_criterion(segmentation_logits, masks).item())
+        if classification_criterion is not None:
+            running_classification_loss += float(classification_criterion(classification_logits, class_ids).item())
+        if segmentation_criterion is not None or classification_criterion is not None:
+            loss_batches += 1
+        class_tracker.update(classification_logits, class_ids)
+
+        for item_index, image_name in enumerate(batch["image_name"]):
+            height = int(batch["original_height"][item_index])
+            width = int(batch["original_width"][item_index])
+            mask, class_id = semantic_mask_from_logits(
+                segmentation_logits,
+                classification_logits,
+                item_index,
+                height,
+                width,
+            )
+            submission_rows.append(
+                {
+                    "image": str(image_name),
+                    "class_id": class_id,
+                    "segmentation_rle": encode_mask_to_rle(mask),
+                }
+            )
+
+    submission = pd.DataFrame(submission_rows, columns=["image", "class_id", "segmentation_rle"])
+    solution = build_val_solution_frame(data_root, set(submission["image"].astype(str)))
+    metrics = detailed_score(solution, submission)
+    classification_metrics = class_tracker.compute()
+    metrics["accuracy"] = classification_metrics["accuracy"]
+    metrics["macro_accuracy_observed"] = classification_metrics["macro_accuracy"]
+    metrics["segmentation_loss"] = running_segmentation_loss / max(1, loss_batches)
+    metrics["classification_loss"] = running_classification_loss / max(1, loss_batches)
+    return {key: float(value) for key, value in metrics.items()}
+
+
+def _optional_int(value: object) -> int | None:
+    if value in {None, "", "None"}:
+        return None
+    return int(value)
+
+
+def _optional_str(value: object) -> str | None:
+    if value in {None, "", "None"}:
+        return None
+    return str(value)

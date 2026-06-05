@@ -118,6 +118,85 @@ Shared helpers live in `src/utils/masks.py`.
 
 Prediction masks must never use `1000`.
 
+## Shared ConvNeXt Multi-Task Pipeline
+
+This is the recommended pipeline before pseudo-labeling. It trains one
+from-scratch ConvNeXt encoder shared by:
+
+- a `300`-class image classification head,
+- a binary foreground/background segmentation head.
+
+The final semantic segmentation mask maps foreground pixels to
+`predicted_class_id + 1`. This matches the observed labeled segmentation data,
+where each training mask contains one foreground class and
+`segmentation_id = class_id + 1`.
+
+No pretrained weights, pretrained backbones, public checkpoints, or foundation
+model features are used.
+
+Quick smoke training run:
+
+```powershell
+python -m src.training.train_multitask --data-root data/raw --epochs 1 --image-size 320 --model-size small --seg-batch-size 1 --cls-batch-size 2 --max-seg-samples 4 --max-cls-samples 8 --max-val-samples 8
+```
+
+Recommended 1x V100 run:
+
+```powershell
+python -m src.training.train_multitask --data-root data/raw --epochs 40 --image-size 320 --model-size small --seg-batch-size 2 --cls-batch-size 16 --num-workers 4
+```
+
+Training uses synchronized random resized crop and horizontal flip for
+segmentation images/masks, image-only color jitter/blur, AMP on CUDA, AdamW,
+cosine LR decay, weighted segmentation CE, Dice loss, and classification CE
+with label smoothing.
+
+Outputs:
+
+```text
+outputs/checkpoints/best_multitask.pt
+outputs/checkpoints/latest_multitask.pt
+outputs/checkpoints/multitask_history.json
+```
+
+The best checkpoint is selected by the validation automated score:
+
+```text
+0.70 * segmentation_score + 0.20 * classification_macro_accuracy
+```
+
+The logged validation metrics include automated score, segmentation score,
+mean IoU, boundary F-score, rare-class mIoU, accuracy, and macro accuracy.
+
+Evaluate the best multi-task checkpoint:
+
+```powershell
+python -m src.training.evaluate_multitask --checkpoint outputs/checkpoints/best_multitask.pt --data-root data/raw --image-size 320
+```
+
+Visualize predictions against labeled validation masks:
+
+```powershell
+python -m src.visualization.visualize_val_predictions --checkpoint outputs/checkpoints/best_multitask.pt --data-root data/raw --split val --num-samples 12
+```
+
+Validation panels contain image, ground truth, prediction, prediction overlay,
+and a difference view. The command can also run on `--split test`, but test
+panels only show raw predictions and overlays because hidden test labels are
+not available and must not be inferred.
+
+Generate a Kaggle test submission:
+
+```powershell
+python -m src.training.predict_multitask --checkpoint outputs/checkpoints/best_multitask.pt --data-root data/raw --image-size 320 --output outputs/submissions/submission.csv
+```
+
+For a quick partial inference smoke check:
+
+```powershell
+python -m src.training.predict_multitask --checkpoint outputs/checkpoints/best_multitask.pt --data-root data/raw --image-size 320 --max-test-samples 8 --no-validate
+```
+
 ## First Segmentation Baseline
 
 This baseline trains a compact U-Net-style CNN from scratch. It does not use
