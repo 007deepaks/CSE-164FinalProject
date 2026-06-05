@@ -140,6 +140,19 @@ Quick smoke training run:
 python -m src.training.train_multitask --data-root data/raw --epochs 1 --image-size 320 --model-size small --seg-batch-size 1 --cls-batch-size 2 --max-seg-samples 4 --max-cls-samples 8 --max-val-samples 8
 ```
 
+Tiny overfit debug run:
+
+```powershell
+python -m src.training.train_multitask --data-root data/raw --debug-overfit --epochs 30 --image-size 320 --model-size tiny --seg-batch-size 2 --cls-batch-size 8 --learning-rate 1e-3
+```
+
+This disables augmentation, label smoothing, weight decay, and drop path, then
+trains on 8 segmentation images and 32 classification images. Each epoch prints
+training binary foreground IoU, binary pixel accuracy, oracle semantic mIoU,
+segmentation-set class accuracy, and classification-set accuracy. If these do
+not climb on the tiny subset, inspect labels, losses, output mapping, and the
+training loop before launching another full VM run.
+
 Recommended 1x V100 run:
 
 ```powershell

@@ -15,7 +15,7 @@ from src.data.classification_dataset import ClassificationDataset
 from src.data.segmentation_dataset import SegmentationDataset
 from src.models.multitask_model import MODEL_CONFIGS, build_multitask_model, resolve_model_config
 from src.training.multitask_utils import args_to_dict, validate_multitask
-from src.utils.masks import IGNORE_ID
+from src.utils.masks import IGNORE_ID, NUM_CLASSES
 
 
 def dice_loss(segmentation_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -113,6 +113,81 @@ def train_classification_batches(
     return {"classification_train_loss": total_loss / max(1, len(loader))}
 
 
+@torch.no_grad()
+def compute_debug_train_metrics(
+    model: nn.Module,
+    seg_loader: DataLoader,
+    cls_loader: DataLoader,
+    device: torch.device,
+) -> dict[str, float]:
+    """Measure whether the model can memorize the tiny debug subsets."""
+    model.eval()
+    seg_intersection = 0
+    seg_union = 0
+    seg_valid_pixels = 0
+    seg_correct_pixels = 0
+    semantic_intersections = torch.zeros(NUM_CLASSES + 1, dtype=torch.float64)
+    semantic_unions = torch.zeros(NUM_CLASSES + 1, dtype=torch.float64)
+    seg_class_correct = 0
+    seg_class_total = 0
+    cls_correct = 0
+    cls_total = 0
+    predicted_foreground_pixels = 0
+    target_foreground_pixels = 0
+
+    for batch in seg_loader:
+        images = batch["image"].to(device, non_blocking=True)
+        masks = batch["mask"].to(device, non_blocking=True)
+        semantic_masks = batch["semantic_mask"].to(device, non_blocking=True)
+        class_ids = batch["class_id"].to(device, non_blocking=True)
+        outputs = model(images)
+        binary_prediction = torch.argmax(outputs["segmentation"], dim=1)
+        class_prediction = torch.argmax(outputs["classification"], dim=1)
+        valid = masks != IGNORE_ID
+        pred_fg = (binary_prediction == 1) & valid
+        target_fg = (masks == 1) & valid
+        seg_intersection += int((pred_fg & target_fg).sum().item())
+        seg_union += int((pred_fg | target_fg).sum().item())
+        seg_correct_pixels += int(((binary_prediction == masks) & valid).sum().item())
+        seg_valid_pixels += int(valid.sum().item())
+        predicted_foreground_pixels += int(pred_fg.sum().item())
+        target_foreground_pixels += int(target_fg.sum().item())
+        seg_class_correct += int((class_prediction == class_ids).sum().item())
+        seg_class_total += int(class_ids.numel())
+
+        oracle_semantic = torch.zeros_like(binary_prediction)
+        semantic_ids = (class_ids.long() + 1).view(-1, 1, 1)
+        oracle_semantic = torch.where(binary_prediction == 1, semantic_ids.expand_as(binary_prediction), oracle_semantic)
+        valid_semantic = semantic_masks != IGNORE_ID
+        for segmentation_id in torch.unique(semantic_masks[valid_semantic]).detach().cpu().tolist():
+            if int(segmentation_id) <= 0:
+                continue
+            pred_class = (oracle_semantic == int(segmentation_id)) & valid_semantic
+            target_class = (semantic_masks == int(segmentation_id)) & valid_semantic
+            semantic_intersections[int(segmentation_id)] += float((pred_class & target_class).sum().item())
+            semantic_unions[int(segmentation_id)] += float((pred_class | target_class).sum().item())
+
+    for batch in cls_loader:
+        images = batch["image"].to(device, non_blocking=True)
+        class_ids = batch["class_id"].to(device, non_blocking=True)
+        outputs = model(images)
+        class_prediction = torch.argmax(outputs["classification"], dim=1)
+        cls_correct += int((class_prediction == class_ids).sum().item())
+        cls_total += int(class_ids.numel())
+
+    present = semantic_unions > 0
+    semantic_miou = float((semantic_intersections[present] / semantic_unions[present]).mean().item()) if present.any() else 0.0
+    return {
+        "debug_train_binary_fg_iou": seg_intersection / max(1, seg_union),
+        "debug_train_binary_pixel_accuracy": seg_correct_pixels / max(1, seg_valid_pixels),
+        "debug_train_oracle_semantic_miou": semantic_miou,
+        "debug_train_seg_class_accuracy": seg_class_correct / max(1, seg_class_total),
+        "debug_train_cls_accuracy": cls_correct / max(1, cls_total),
+        "debug_train_predicted_foreground_pct": 100.0 * predicted_foreground_pixels / max(1, seg_valid_pixels),
+        "debug_train_target_foreground_pct": 100.0 * target_foreground_pixels / max(1, seg_valid_pixels),
+    }
+
+
 def save_checkpoint(
     path: Path,
     model: nn.Module,
@@ -166,11 +241,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-cls-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("outputs/checkpoints"))
+    parser.add_argument(
+        "--debug-overfit",
+        action="store_true",
+        help="Overfit 8 segmentation and 32 classification samples with augmentation disabled.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.debug_overfit:
+        args.max_seg_samples = 8
+        args.max_cls_samples = 32
+        args.max_val_samples = 32 if args.max_val_samples is None else args.max_val_samples
+        args.num_workers = 0
+        args.label_smoothing = 0.0
+        args.weight_decay = 0.0
+        args.drop_path = 0.0
+        args.min_learning_rate = min(args.min_learning_rate, args.learning_rate)
+        print("DEBUG OVERFIT: using 8 segmentation samples, 32 classification samples, no augmentation.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
     resolved = resolve_model_config(args.model_size, args.base_channels, args.depths, args.decoder_channels)
@@ -188,14 +278,14 @@ def main() -> None:
         image_size=args.image_size,
         target_mode="binary",
         max_samples=args.max_seg_samples,
-        augment=True,
+        augment=not args.debug_overfit,
     )
     cls_train = ClassificationDataset(
         args.data_root,
         split="train_labeled",
         image_size=args.image_size,
         max_samples=args.max_cls_samples,
-        augment=True,
+        augment=not args.debug_overfit,
     )
     val_dataset = SegmentationDataset(
         args.data_root,
@@ -291,6 +381,11 @@ def main() -> None:
             segmentation_criterion,
             classification_criterion,
         )
+        debug_metrics = (
+            compute_debug_train_metrics(model, seg_loader, cls_loader, device)
+            if args.debug_overfit
+            else {}
+        )
         scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
         row = {
@@ -298,6 +393,7 @@ def main() -> None:
             **seg_metrics,
             **cls_metrics,
             **val_metrics,
+            **debug_metrics,
             "learning_rate": float(current_lr),
         }
         history.append(row)
@@ -313,6 +409,17 @@ def main() -> None:
             f"macro_acc={row['classification_macro_accuracy']:.4f} "
             f"lr={current_lr:.6f}"
         )
+        if args.debug_overfit:
+            print(
+                "  DEBUG train "
+                f"binary_fg_iou={row['debug_train_binary_fg_iou']:.4f} "
+                f"binary_pix_acc={row['debug_train_binary_pixel_accuracy']:.4f} "
+                f"oracle_sem_mIoU={row['debug_train_oracle_semantic_miou']:.4f} "
+                f"seg_cls_acc={row['debug_train_seg_class_accuracy']:.4f} "
+                f"cls_acc={row['debug_train_cls_accuracy']:.4f} "
+                f"pred_fg={row['debug_train_predicted_foreground_pct']:.2f}% "
+                f"target_fg={row['debug_train_target_foreground_pct']:.2f}%"
+            )
         save_checkpoint(
             args.checkpoint_dir / "latest_multitask.pt",
             model,
