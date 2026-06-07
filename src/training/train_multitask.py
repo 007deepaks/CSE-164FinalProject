@@ -11,7 +11,7 @@ from torch import nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-from src.data.classification_dataset import ClassificationDataset
+from src.data.classification_dataset import BalancedClassBatchSampler, ClassificationDataset
 from src.data.segmentation_dataset import SegmentationDataset
 from src.models.multitask_model import MODEL_CONFIGS, build_multitask_model, resolve_model_config
 from src.training.multitask_utils import args_to_dict, validate_multitask
@@ -157,6 +157,128 @@ def train_classification_batches(
     }
 
 
+def train_joint_mixed_batches(
+    model: nn.Module,
+    seg_loader: DataLoader,
+    cls_loader: DataLoader,
+    segmentation_criterion: nn.Module,
+    classification_criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    scaler: GradScaler,
+    use_amp: bool,
+    segmentation_loss_weight: float,
+    dice_loss_weight: float,
+    seg_classification_loss_weight: float,
+    cls_loss_weight: float,
+    gradient_clip: float,
+) -> dict[str, float]:
+    model.train()
+    totals = {
+        "segmentation_ce_loss": 0.0,
+        "segmentation_dice_loss": 0.0,
+        "segmentation_classification_loss": 0.0,
+        "segmentation_total_loss": 0.0,
+        "classification_train_loss": 0.0,
+        "mixed_total_loss": 0.0,
+        "seg_classification_train_accuracy": 0.0,
+        "classification_train_accuracy": 0.0,
+        "mixed_skipped_batches": 0.0,
+    }
+    seg_iter = iter(seg_loader)
+    cls_iter = iter(cls_loader)
+    steps = max(len(seg_loader), len(cls_loader))
+    seg_class_correct = 0
+    seg_class_total = 0
+    cls_correct = 0
+    cls_total = 0
+    completed_steps = 0
+
+    for batch_index in range(1, steps + 1):
+        try:
+            seg_batch = next(seg_iter)
+        except StopIteration:
+            seg_iter = iter(seg_loader)
+            seg_batch = next(seg_iter)
+        try:
+            cls_batch = next(cls_iter)
+        except StopIteration:
+            cls_iter = iter(cls_loader)
+            cls_batch = next(cls_iter)
+
+        seg_images = seg_batch["image"].to(device, non_blocking=True)
+        masks = seg_batch["mask"].to(device, non_blocking=True)
+        seg_class_ids = seg_batch["class_id"].to(device, non_blocking=True)
+        cls_images = cls_batch["image"].to(device, non_blocking=True)
+        cls_class_ids = cls_batch["class_id"].to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device_type="cuda", enabled=use_amp):
+            seg_outputs = model(seg_images)
+            cls_outputs = model(cls_images)
+            ce = segmentation_criterion(seg_outputs["segmentation"], masks)
+            seg_class_loss = classification_criterion(seg_outputs["classification"], seg_class_ids)
+            cls_loss = classification_criterion(cls_outputs["classification"], cls_class_ids)
+        dice = dice_loss(seg_outputs["segmentation"].float(), masks)
+        seg_total = segmentation_loss_weight * ce + dice_loss_weight * dice + seg_classification_loss_weight * seg_class_loss
+        loss = seg_total + cls_loss_weight * cls_loss
+
+        components = {
+            "ce": ce,
+            "dice": dice,
+            "seg_class_loss": seg_class_loss,
+            "cls_loss": cls_loss,
+            "loss": loss,
+        }
+        bad_components = [name for name, value in components.items() if not torch.isfinite(value.detach()).all()]
+        if bad_components:
+            totals["mixed_skipped_batches"] += 1.0
+            print(f"  WARNING: skipping mixed batch {batch_index:04d}; non-finite {bad_components}")
+            continue
+
+        scaler.scale(loss).backward()
+        if gradient_clip > 0:
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+            if not torch.isfinite(grad_norm):
+                totals["mixed_skipped_batches"] += 1.0
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                print(f"  WARNING: skipping mixed batch {batch_index:04d}; non-finite grad_norm")
+                continue
+        scaler.step(optimizer)
+        scaler.update()
+
+        completed_steps += 1
+        totals["segmentation_ce_loss"] += float(ce.item())
+        totals["segmentation_dice_loss"] += float(dice.item())
+        totals["segmentation_classification_loss"] += float(seg_class_loss.item())
+        totals["segmentation_total_loss"] += float(seg_total.item())
+        totals["classification_train_loss"] += float(cls_loss.item())
+        totals["mixed_total_loss"] += float(loss.item())
+
+        seg_predictions = torch.argmax(seg_outputs["classification"].detach(), dim=1)
+        cls_predictions = torch.argmax(cls_outputs["classification"].detach(), dim=1)
+        seg_class_correct += int((seg_predictions == seg_class_ids).sum().item())
+        seg_class_total += int(seg_class_ids.numel())
+        cls_correct += int((cls_predictions == cls_class_ids).sum().item())
+        cls_total += int(cls_class_ids.numel())
+        if batch_index % 20 == 0 or batch_index == steps:
+            print(
+                f"  mixed batch {batch_index:04d}/{steps} "
+                f"seg_loss={seg_total.item():.4f} cls_loss={cls_loss.item():.4f}"
+            )
+
+    divisor = max(1, completed_steps)
+    averages = {
+        key: (value / divisor if key not in {"mixed_skipped_batches"} else value)
+        for key, value in totals.items()
+    }
+    averages["seg_classification_train_accuracy"] = seg_class_correct / max(1, seg_class_total)
+    averages["classification_train_accuracy"] = cls_correct / max(1, cls_total)
+    return averages
+
+
 @torch.no_grad()
 def compute_debug_train_metrics(
     model: nn.Module,
@@ -266,15 +388,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, default=Path("data/raw"))
     parser.add_argument("--image-size", type=int, default=320)
     parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--warmup-epochs", type=int, default=8)
+    parser.add_argument("--joint-epochs", type=int, default=24)
     parser.add_argument("--seg-batch-size", type=int, default=2)
     parser.add_argument("--cls-batch-size", type=int, default=16)
     parser.add_argument("--val-batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--warmup-learning-rate", type=float, default=3e-4)
     parser.add_argument("--min-learning-rate", type=float, default=2e-5)
     parser.add_argument("--weight-decay", type=float, default=5e-2)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
-    parser.add_argument("--stage", choices=["classifier_warmup", "joint"], default="joint")
+    parser.add_argument("--stage", choices=["classifier_warmup", "joint", "warmup_joint"], default="joint")
     parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--background-weight", type=float, default=0.05)
     parser.add_argument("--foreground-weight", type=float, default=1.0)
@@ -293,6 +418,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-cls-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("outputs/checkpoints"))
+    parser.add_argument("--balanced-class-batches", action="store_true")
+    parser.add_argument("--validate-every", type=int, default=1)
+    parser.add_argument("--full-val-every", type=int, default=1)
+    parser.add_argument("--quick-val-samples", type=int)
     parser.add_argument(
         "--no-random-crop",
         action="store_true",
@@ -306,8 +435,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def run_one_stage(args: argparse.Namespace) -> Path:
     if args.debug_overfit:
         args.max_seg_samples = 8
         args.max_cls_samples = 32
@@ -341,7 +469,7 @@ def main() -> None:
     )
     cls_train = ClassificationDataset(
         args.data_root,
-        split="train_labeled",
+        split="train_combined",
         image_size=args.image_size,
         max_samples=args.max_cls_samples,
         augment=not args.debug_overfit,
@@ -362,13 +490,22 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
-    cls_loader = DataLoader(
-        cls_train,
-        batch_size=args.cls_batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-    )
+    if args.balanced_class_batches:
+        cls_batch_sampler = BalancedClassBatchSampler(cls_train.samples, args.cls_batch_size)
+        cls_loader = DataLoader(
+            cls_train,
+            batch_sampler=cls_batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+    else:
+        cls_loader = DataLoader(
+            cls_train,
+            batch_size=args.cls_batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.val_batch_size,
@@ -380,6 +517,24 @@ def main() -> None:
         f"Train samples: segmentation={len(seg_train)}, classification={len(cls_train)}; "
         f"val={len(val_dataset)}"
     )
+    quick_val_loader = None
+    if args.quick_val_samples is not None and args.quick_val_samples < len(val_dataset):
+        quick_val_dataset = SegmentationDataset(
+            args.data_root,
+            split="val",
+            image_size=args.image_size,
+            target_mode="binary",
+            max_samples=args.quick_val_samples,
+            augment=False,
+        )
+        quick_val_loader = DataLoader(
+            quick_val_dataset,
+            batch_size=args.val_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+        print(f"Quick validation samples: {len(quick_val_dataset)}")
 
     model = build_multitask_model(
         model_size=args.model_size,
@@ -432,9 +587,10 @@ def main() -> None:
                 metric_prefix="seg_classification_train",
             )
         else:
-            seg_metrics = train_segmentation_batches(
+            mixed_metrics = train_joint_mixed_batches(
                 model,
                 seg_loader,
+                cls_loader,
                 segmentation_criterion,
                 classification_criterion,
                 optimizer,
@@ -444,33 +600,65 @@ def main() -> None:
                 args.segmentation_loss_weight,
                 args.dice_loss_weight,
                 args.seg_classification_loss_weight,
+                args.cls_loss_weight,
                 args.gradient_clip,
             )
-            seg_cls_metrics = {
-                "seg_classification_train_loss": seg_metrics["segmentation_classification_loss"],
-                "seg_classification_train_accuracy": 0.0,
-                "seg_classification_train_skipped_batches": 0.0,
+            seg_metrics = {
+                "segmentation_ce_loss": mixed_metrics["segmentation_ce_loss"],
+                "segmentation_dice_loss": mixed_metrics["segmentation_dice_loss"],
+                "segmentation_classification_loss": mixed_metrics["segmentation_classification_loss"],
+                "segmentation_total_loss": mixed_metrics["segmentation_total_loss"],
+                "segmentation_skipped_batches": mixed_metrics["mixed_skipped_batches"],
             }
-        cls_metrics = train_classification_batches(
-            model,
-            cls_loader,
-            classification_criterion,
-            optimizer,
-            device,
-            scaler,
-            use_amp,
-            args.cls_loss_weight,
-            args.gradient_clip,
-            metric_prefix="classification_train",
-        )
-        val_metrics = validate_multitask(
-            model,
-            val_loader,
-            args.data_root,
-            device,
-            segmentation_criterion,
-            classification_criterion,
-        )
+            seg_cls_metrics = {
+                "seg_classification_train_loss": mixed_metrics["segmentation_classification_loss"],
+                "seg_classification_train_accuracy": mixed_metrics["seg_classification_train_accuracy"],
+                "seg_classification_train_skipped_batches": mixed_metrics["mixed_skipped_batches"],
+            }
+            cls_metrics = {
+                "classification_train_loss": mixed_metrics["classification_train_loss"],
+                "classification_train_accuracy": mixed_metrics["classification_train_accuracy"],
+                "classification_train_skipped_batches": mixed_metrics["mixed_skipped_batches"],
+            }
+        if args.stage == "classifier_warmup":
+            cls_metrics = train_classification_batches(
+                model,
+                cls_loader,
+                classification_criterion,
+                optimizer,
+                device,
+                scaler,
+                use_amp,
+                args.cls_loss_weight,
+                args.gradient_clip,
+                metric_prefix="classification_train",
+            )
+        should_validate = epoch % max(1, args.validate_every) == 0 or epoch == args.epochs
+        should_full_validate = epoch % max(1, args.full_val_every) == 0 or epoch == args.epochs
+        val_metrics = {}
+        validation_kind = "skipped"
+        if should_validate:
+            validation_loader = val_loader if should_full_validate or quick_val_loader is None else quick_val_loader
+            validation_kind = "full" if validation_loader is val_loader else "quick"
+            val_metrics = validate_multitask(
+                model,
+                validation_loader,
+                args.data_root,
+                device,
+                segmentation_criterion,
+                classification_criterion,
+            )
+        else:
+            val_metrics = {
+                "automated_score": 0.0,
+                "segmentation_score": 0.0,
+                "mean_iou": 0.0,
+                "binary_foreground_iou": 0.0,
+                "oracle_semantic_miou": 0.0,
+                "boundary_f_score": 0.0,
+                "rare_class_miou": 0.0,
+                "classification_macro_accuracy": 0.0,
+            }
         debug_metrics = (
             compute_debug_train_metrics(model, seg_loader, cls_loader, device)
             if args.debug_overfit
@@ -486,6 +674,7 @@ def main() -> None:
             **val_metrics,
             **debug_metrics,
             "learning_rate": float(current_lr),
+            "validation_kind": validation_kind,
         }
         history.append(row)
         print(
@@ -529,7 +718,8 @@ def main() -> None:
             if args.stage == "classifier_warmup"
             else row["automated_score"]
         )
-        if selection_metric > best_score:
+        can_save_best = validation_kind == "full"
+        if can_save_best and selection_metric > best_score:
             best_score = selection_metric
             save_checkpoint(
                 args.checkpoint_dir / "best_multitask.pt",
@@ -545,6 +735,32 @@ def main() -> None:
     history_path = args.checkpoint_dir / "multitask_history.json"
     history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
     print(f"\nWrote history: {history_path}")
+    return args.checkpoint_dir / "best_multitask.pt"
+
+
+def main() -> None:
+    args = parse_args()
+    if args.stage != "warmup_joint":
+        run_one_stage(args)
+        return
+
+    base_dir = args.checkpoint_dir
+    warmup_args = argparse.Namespace(**vars(args))
+    warmup_args.stage = "classifier_warmup"
+    warmup_args.epochs = args.warmup_epochs
+    warmup_args.learning_rate = args.warmup_learning_rate
+    warmup_args.checkpoint_dir = base_dir / "warmup"
+    warmup_args.resume_checkpoint = None
+    print("\n=== Warmup phase ===")
+    warmup_checkpoint = run_one_stage(warmup_args)
+
+    joint_args = argparse.Namespace(**vars(args))
+    joint_args.stage = "joint"
+    joint_args.epochs = args.joint_epochs
+    joint_args.checkpoint_dir = base_dir / "joint"
+    joint_args.resume_checkpoint = warmup_checkpoint
+    print("\n=== Joint phase ===")
+    run_one_stage(joint_args)
 
 
 if __name__ == "__main__":

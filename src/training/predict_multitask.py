@@ -26,6 +26,7 @@ def predict(
     num_workers: int,
     max_test_samples: int | None,
     validate_with_starter: bool,
+    tta: str,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _, saved_args = load_multitask_checkpoint(checkpoint_path, device)
@@ -44,6 +45,13 @@ def predict(
     for batch_index, batch in enumerate(loader, start=1):
         images = batch["image"].to(device, non_blocking=True)
         outputs = model(images)
+        if tta == "hflip":
+            flipped_outputs = model(torch.flip(images, dims=(-1,)))
+            outputs = {
+                "classification": 0.5 * (outputs["classification"] + flipped_outputs["classification"]),
+                "segmentation": 0.5
+                * (outputs["segmentation"] + torch.flip(flipped_outputs["segmentation"], dims=(-1,))),
+            }
         for item_index, image_name in enumerate(batch["image_name"]):
             height = int(batch["original_height"][item_index])
             width = int(batch["original_width"][item_index])
@@ -96,6 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-test-samples", type=int)
     parser.add_argument("--no-validate", action="store_true")
+    parser.add_argument("--tta", choices=["none", "hflip"], default="none")
     return parser.parse_args()
 
 
@@ -110,6 +119,7 @@ def main() -> None:
         num_workers=args.num_workers,
         max_test_samples=args.max_test_samples,
         validate_with_starter=not args.no_validate,
+        tta=args.tta,
     )
 
 

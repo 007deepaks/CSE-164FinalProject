@@ -171,20 +171,18 @@ Watch `bin_iou` and `oracle_mIoU` separately from `mIoU`. If they rise while
 bottleneck. If all three stay flat, inspect masks, foreground percentage, and
 loss behavior before another long run.
 
-Classifier-first warmup, then joint fine-tuning:
+One-command classifier warmup, then mixed joint fine-tuning:
 
 ```powershell
-python -m src.training.train_multitask --data-root data/raw --stage classifier_warmup --epochs 30 --image-size 320 --model-size tiny --seg-batch-size 8 --cls-batch-size 32 --num-workers 4 --learning-rate 3e-4 --weight-decay 1e-4 --drop-path 0.0 --no-random-crop --label-smoothing 0.0 --seg-classification-loss-weight 1.0 --cls-loss-weight 1.0 --checkpoint-dir outputs/checkpoints/classifier_warmup
+python -m src.training.train_multitask --data-root data/raw --stage warmup_joint --warmup-epochs 8 --joint-epochs 24 --image-size 320 --model-size tiny --seg-batch-size 4 --cls-batch-size 28 --num-workers 4 --learning-rate 2e-4 --warmup-learning-rate 3e-4 --weight-decay 1e-4 --drop-path 0.0 --no-random-crop --balanced-class-batches --seg-classification-loss-weight 1.0 --cls-loss-weight 1.0 --validate-every 2 --full-val-every 4 --quick-val-samples 150 --checkpoint-dir outputs/checkpoints/warmup_joint_tiny
 ```
 
-```powershell
-python -m src.training.train_multitask --data-root data/raw --stage joint --resume-checkpoint outputs/checkpoints/classifier_warmup/best_multitask.pt --epochs 30 --image-size 320 --model-size tiny --seg-batch-size 4 --cls-batch-size 32 --num-workers 4 --learning-rate 1e-4 --weight-decay 1e-4 --drop-path 0.0 --no-random-crop --seg-classification-loss-weight 1.0 --cls-loss-weight 1.0 --checkpoint-dir outputs/checkpoints/joint_from_warmup
-```
-
-The warmup stage trains classification on both `train_labeled` and `train_seg`
-class labels, leaves segmentation loss off, and saves best by validation macro
-accuracy. The joint stage resumes those weights and saves best by automated
-validation score. Non-finite losses or gradients are reported and skipped.
+The warmup stage trains classification on a combined 10,500-image labeled set:
+`train_labeled` plus `train_seg` class labels. The joint stage resumes the best
+warmup weights and uses mixed optimizer steps containing one segmentation batch
+and one classification batch. Full validation runs every `--full-val-every`
+epochs; quick validation uses `--quick-val-samples` on intermediate validation
+epochs. Non-finite losses or gradients are reported and skipped.
 
 Training uses synchronized random resized crop and horizontal flip for
 segmentation images/masks, image-only color jitter/blur, AMP on CUDA, AdamW,
@@ -229,6 +227,12 @@ Generate a Kaggle test submission:
 
 ```powershell
 python -m src.training.predict_multitask --checkpoint outputs/checkpoints/best_multitask.pt --data-root data/raw --image-size 320 --output outputs/submissions/submission.csv
+```
+
+Generate a TTA submission from the one-command pipeline:
+
+```powershell
+python -m src.training.predict_multitask --checkpoint outputs/checkpoints/warmup_joint_tiny/joint/best_multitask.pt --data-root data/raw --image-size 320 --batch-size 4 --num-workers 4 --tta hflip --output outputs/submissions/warmup_joint_tiny_tta.csv
 ```
 
 For a quick partial inference smoke check:
