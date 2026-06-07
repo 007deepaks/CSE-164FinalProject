@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from itertools import cycle
 from pathlib import Path
 
 import torch
@@ -120,8 +119,8 @@ def train_one_epoch(
     args: argparse.Namespace,
 ) -> dict[str, float]:
     model.train()
-    unlabeled_iter = cycle(unlabeled_loader)
-    supervised_iter = cycle(supervised_loader)
+    unlabeled_iter = infinite_loader(unlabeled_loader)
+    supervised_iter = infinite_loader(supervised_loader)
     steps = args.steps_per_epoch or len(supervised_loader)
     running_supervised_loss = 0.0
     running_unsupervised_loss = 0.0
@@ -202,6 +201,13 @@ def train_one_epoch(
         "train_accuracy": train_metrics["accuracy"],
         "train_macro_accuracy": train_metrics["macro_accuracy"],
     }
+
+
+def infinite_loader(loader: DataLoader):
+    """Yield batches forever without caching them like itertools.cycle does."""
+    while True:
+        for batch in loader:
+            yield batch
 
 
 def parse_args() -> argparse.Namespace:
