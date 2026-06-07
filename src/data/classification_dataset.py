@@ -8,12 +8,13 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from torch.utils.data import Sampler
 from torch.utils.data import Dataset
 
-from src.data.segmentation_dataset import DEFAULT_IMAGE_SIZE, augment_image_to_tensor, image_to_tensor
+from src.data.segmentation_dataset import DEFAULT_IMAGE_SIZE, _normalize_image, augment_image_to_tensor, image_to_tensor
 from src.utils.masks import IGNORE_ID, decode_rgb_mask
 
 
@@ -139,6 +140,116 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         if sample.class_id is not None:
             item["class_id"] = int(sample.class_id)
         return item
+
+
+class UnlabeledFixMatchDataset(Dataset[dict[str, object]]):
+    """Return weak and strong views of train_unlabeled images for classifier FixMatch."""
+
+    def __init__(
+        self,
+        data_root: str | Path = "data/raw",
+        image_size: int = DEFAULT_IMAGE_SIZE,
+        max_samples: int | None = None,
+        random_crop: bool = False,
+    ) -> None:
+        self.data_root = Path(data_root)
+        self.image_size = image_size
+        self.random_crop = random_crop
+        image_root = self.data_root / "train_unlabeled"
+        candidates = sorted(image_root.rglob("*.JPEG"))
+        if not candidates:
+            candidates = sorted(image_root.rglob("*.jpg")) + sorted(image_root.rglob("*.png"))
+        self.image_paths = candidates
+        if max_samples is not None:
+            self.image_paths = self.image_paths[:max_samples]
+        if not self.image_paths:
+            raise ValueError(f"No unlabeled images found under {image_root}")
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        image_path = self.image_paths[index]
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            weak = weak_fixmatch_image_to_tensor(image, self.image_size, self.random_crop)
+            strong = strong_fixmatch_image_to_tensor(image, self.image_size, self.random_crop)
+        return {
+            "weak_image": weak,
+            "strong_image": strong,
+            "image_name": image_path.name,
+        }
+
+
+def weak_fixmatch_image_to_tensor(
+    image: Image.Image,
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    random_crop: bool = False,
+) -> torch.Tensor:
+    """Weak unlabeled view: resize plus optional crop and horizontal flip."""
+    image = image.convert("RGB")
+    if random_crop:
+        image = augment_image_to_tensor(image, image_size, random_crop=True)
+        return image
+    image = image.resize((image_size, image_size), Image.Resampling.BILINEAR)
+    if random.random() < 0.5:
+        image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    return _normalize_image(image)
+
+
+def strong_fixmatch_image_to_tensor(
+    image: Image.Image,
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    random_crop: bool = False,
+) -> torch.Tensor:
+    """Strong unlabeled view with heavier PIL transforms and tensor cutout."""
+    image = image.convert("RGB")
+    if random_crop:
+        image = _random_square_crop(image)
+    image = image.resize((image_size, image_size), Image.Resampling.BILINEAR)
+    if random.random() < 0.5:
+        image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    image = _strong_jitter_image(image)
+    tensor = _normalize_image(image)
+    if random.random() < 0.65:
+        tensor = _cutout_tensor(tensor, max_fraction=0.35)
+    return tensor
+
+
+def _random_square_crop(image: Image.Image) -> Image.Image:
+    width, height = image.size
+    crop_size = random.randint(int(0.75 * min(width, height)), min(width, height))
+    left = random.randint(0, max(0, width - crop_size))
+    top = random.randint(0, max(0, height - crop_size))
+    return image.crop((left, top, left + crop_size, top + crop_size))
+
+
+def _strong_jitter_image(image: Image.Image) -> Image.Image:
+    operations = [
+        lambda img: ImageEnhance.Brightness(img).enhance(random.uniform(0.45, 1.55)),
+        lambda img: ImageEnhance.Contrast(img).enhance(random.uniform(0.45, 1.65)),
+        lambda img: ImageEnhance.Color(img).enhance(random.uniform(0.35, 1.65)),
+        lambda img: ImageEnhance.Sharpness(img).enhance(random.uniform(0.3, 2.0)),
+        lambda img: img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 1.2))),
+        lambda img: ImageOps.solarize(img, threshold=random.randint(96, 192)),
+        lambda img: ImageOps.posterize(img, bits=random.randint(4, 6)),
+    ]
+    for operation in random.sample(operations, k=random.randint(2, 4)):
+        image = operation(image)
+    if random.random() < 0.15:
+        image = ImageOps.grayscale(image).convert("RGB")
+    return image
+
+
+def _cutout_tensor(tensor: torch.Tensor, max_fraction: float = 0.35) -> torch.Tensor:
+    _, height, width = tensor.shape
+    erase_height = random.randint(1, max(1, int(height * max_fraction)))
+    erase_width = random.randint(1, max(1, int(width * max_fraction)))
+    top = random.randint(0, max(0, height - erase_height))
+    left = random.randint(0, max(0, width - erase_width))
+    tensor = tensor.clone()
+    tensor[:, top : top + erase_height, left : left + erase_width] = 0.0
+    return tensor
 
 
 def crop_image_from_mask(image: Image.Image, mask_path: Path | None, padding_fraction: float) -> Image.Image:
