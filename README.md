@@ -380,7 +380,7 @@ on `train_labeled + train_seg` labels and mask-guided crops.
 Start with a high confidence threshold:
 
 ```powershell
-python -m src.training.train_fixmatch_classification --data-root data/raw --resume-checkpoint outputs/checkpoints/classifier_combined_crops/best_classification.pt --image-size 320 --epochs 20 --batch-size 32 --unlabeled-batch-size 64 --num-workers 4 --learning-rate 1e-4 --weight-decay 1e-4 --confidence-threshold 0.95 --unlabeled-loss-weight 1.0 --split train_combined --include-seg-crops --no-random-crop --checkpoint-dir outputs/checkpoints/classifier_fixmatch_095
+python -m src.training.train_fixmatch_classification --data-root data/raw --resume-checkpoint outputs/checkpoints/classifier_combined_crops/best_classification.pt --image-size 320 --epochs 20 --batch-size 24 --unlabeled-batch-size 32 --weak-forward-batch-size 16 --strong-forward-batch-size 16 --num-workers 0 --learning-rate 1e-4 --weight-decay 1e-4 --confidence-threshold 0.95 --unlabeled-loss-weight 1.0 --split train_combined --include-seg-crops --no-random-crop --checkpoint-dir outputs/checkpoints/classifier_fixmatch_095
 ```
 
 The log reports `accept`, the fraction of unlabeled images whose pseudo-label
@@ -388,7 +388,7 @@ confidence was high enough to train on. If `accept` stays near zero for several
 epochs, lower the threshold for a second round:
 
 ```powershell
-python -m src.training.train_fixmatch_classification --data-root data/raw --resume-checkpoint outputs/checkpoints/classifier_fixmatch_095/best_fixmatch_classification.pt --image-size 320 --epochs 15 --batch-size 32 --unlabeled-batch-size 64 --num-workers 4 --learning-rate 5e-5 --weight-decay 1e-4 --confidence-threshold 0.90 --unlabeled-loss-weight 0.75 --split train_combined --include-seg-crops --no-random-crop --checkpoint-dir outputs/checkpoints/classifier_fixmatch_090
+python -m src.training.train_fixmatch_classification --data-root data/raw --resume-checkpoint outputs/checkpoints/classifier_fixmatch_095/best_fixmatch_classification.pt --image-size 320 --epochs 15 --batch-size 24 --unlabeled-batch-size 32 --weak-forward-batch-size 16 --strong-forward-batch-size 16 --num-workers 0 --learning-rate 5e-5 --weight-decay 1e-4 --confidence-threshold 0.90 --unlabeled-loss-weight 0.75 --split train_combined --include-seg-crops --no-random-crop --checkpoint-dir outputs/checkpoints/classifier_fixmatch_090
 ```
 
 After FixMatch, reuse the same segmentation checkpoint and retune the foreground

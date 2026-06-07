@@ -138,8 +138,12 @@ def train_one_epoch(
         strong_images = unlabeled_batch["strong_image"].to(device, non_blocking=True)
 
         with torch.no_grad():
-            with autocast(device_type="cuda", enabled=use_amp):
-                weak_logits = model(weak_images)
+            weak_logits_parts: list[torch.Tensor] = []
+            weak_chunk_size = args.weak_forward_batch_size or len(weak_images)
+            for weak_chunk in weak_images.split(weak_chunk_size):
+                with autocast(device_type="cuda", enabled=use_amp):
+                    weak_logits_parts.append(model(weak_chunk).float())
+            weak_logits = torch.cat(weak_logits_parts, dim=0)
             pseudo_probabilities = torch.softmax(weak_logits.float(), dim=1)
             pseudo_confidence, pseudo_targets = pseudo_probabilities.max(dim=1)
             confidence_mask = pseudo_confidence.ge(args.confidence_threshold)
@@ -147,13 +151,18 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=use_amp):
             supervised_logits = model(supervised_images)
-            strong_logits = model(strong_images)
             supervised_loss = supervised_criterion(supervised_logits, supervised_targets)
-            unlabeled_losses = nn.functional.cross_entropy(strong_logits, pseudo_targets, reduction="none")
             if confidence_mask.any():
-                unsupervised_loss = unlabeled_losses[confidence_mask].mean()
+                accepted_strong_images = strong_images[confidence_mask]
+                accepted_targets = pseudo_targets[confidence_mask]
+                accepted_logits_parts: list[torch.Tensor] = []
+                strong_chunk_size = args.strong_forward_batch_size or len(accepted_strong_images)
+                for strong_chunk in accepted_strong_images.split(strong_chunk_size):
+                    accepted_logits_parts.append(model(strong_chunk))
+                strong_logits = torch.cat(accepted_logits_parts, dim=0)
+                unsupervised_loss = nn.functional.cross_entropy(strong_logits, accepted_targets)
             else:
-                unsupervised_loss = strong_logits.sum() * 0.0
+                unsupervised_loss = supervised_logits.sum() * 0.0
             loss = supervised_loss + args.unlabeled_loss_weight * unsupervised_loss
 
         if not torch.isfinite(loss):
@@ -203,6 +212,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--unlabeled-batch-size", type=int, default=64)
+    parser.add_argument("--weak-forward-batch-size", type=int)
+    parser.add_argument("--strong-forward-batch-size", type=int)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--steps-per-epoch", type=int)
     parser.add_argument("--print-every", type=int, default=50)
