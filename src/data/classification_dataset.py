@@ -8,11 +8,13 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 from torch.utils.data import Sampler
 from torch.utils.data import Dataset
 
 from src.data.segmentation_dataset import DEFAULT_IMAGE_SIZE, augment_image_to_tensor, image_to_tensor
+from src.utils.masks import IGNORE_ID, decode_rgb_mask
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,8 @@ class ClassificationSample:
     image_path: Path
     image_name: str
     class_id: int | None = None
+    mask_path: Path | None = None
+    crop_mode: str = "full"
 
 
 def _read_json(path: Path) -> object:
@@ -37,6 +41,8 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         max_samples: int | None = None,
         augment: bool = False,
         random_crop: bool = True,
+        include_seg_crops: bool = False,
+        crop_padding: float = 0.15,
     ) -> None:
         if split not in {"train_labeled", "train_combined", "val", "test"}:
             raise ValueError("split must be 'train_labeled', 'train_combined', 'val', or 'test'")
@@ -45,6 +51,8 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         self.image_size = image_size
         self.augment = augment
         self.random_crop = random_crop
+        self.include_seg_crops = include_seg_crops
+        self.crop_padding = crop_padding
         self.samples = self._load_samples()
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
@@ -62,14 +70,27 @@ class ClassificationDataset(Dataset[dict[str, object]]):
             ]
             if self.split == "train_combined":
                 seg_rows = _read_json(self.data_root / "metadata" / "train_seg.json")
-                samples.extend(
+                seg_samples = [
                     ClassificationSample(
                         image_path=self.data_root / str(row["image"]),
                         image_name=Path(str(row["image"])).name,
                         class_id=int(row["class_id"]),
+                        mask_path=self.data_root / str(row["mask"]),
                     )
                     for row in seg_rows
-                )
+                ]
+                samples.extend(seg_samples)
+                if self.include_seg_crops:
+                    samples.extend(
+                        ClassificationSample(
+                            image_path=sample.image_path,
+                            image_name=f"{sample.image_path.stem}_crop{sample.image_path.suffix}",
+                            class_id=sample.class_id,
+                            mask_path=sample.mask_path,
+                            crop_mode="mask_crop",
+                        )
+                        for sample in seg_samples
+                    )
             return samples
 
         if self.split == "val":
@@ -100,6 +121,8 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         sample = self.samples[index]
         with Image.open(sample.image_path) as image:
             image = image.convert("RGB")
+            if sample.crop_mode == "mask_crop":
+                image = crop_image_from_mask(image, sample.mask_path, self.crop_padding)
             original_size = image.size
             image_tensor = (
                 augment_image_to_tensor(image, self.image_size, self.random_crop)
@@ -116,6 +139,29 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         if sample.class_id is not None:
             item["class_id"] = int(sample.class_id)
         return item
+
+
+def crop_image_from_mask(image: Image.Image, mask_path: Path | None, padding_fraction: float) -> Image.Image:
+    """Crop an image around non-background mask pixels, with proportional padding."""
+    if mask_path is None:
+        return image
+    mask = decode_rgb_mask(mask_path)
+    foreground = (mask > 0) & (mask != IGNORE_ID)
+    if not foreground.any():
+        return image
+    ys, xs = np.where(foreground)
+    left = int(xs.min())
+    right = int(xs.max()) + 1
+    top = int(ys.min())
+    bottom = int(ys.max()) + 1
+    box_width = right - left
+    box_height = bottom - top
+    pad = int(round(max(box_width, box_height) * max(0.0, padding_fraction)))
+    left = max(0, left - pad)
+    top = max(0, top - pad)
+    right = min(image.width, right + pad)
+    bottom = min(image.height, bottom + pad)
+    return image.crop((left, top, right, bottom))
 
 
 class BalancedClassBatchSampler(Sampler[list[int]]):

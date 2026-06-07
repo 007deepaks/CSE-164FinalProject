@@ -11,7 +11,7 @@ from torch import nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-from src.data.classification_dataset import ClassificationDataset
+from src.data.classification_dataset import BalancedClassBatchSampler, ClassificationDataset
 from src.metrics.classification_metrics import ClassificationMetricTracker
 from src.models.classification_model import build_classification_model, parse_depths
 
@@ -99,6 +99,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-learning-rate", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=5e-2)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--split", choices=["train_labeled", "train_combined"], default="train_labeled")
+    parser.add_argument("--include-seg-crops", action="store_true")
+    parser.add_argument("--crop-padding", type=float, default=0.15)
+    parser.add_argument("--balanced-class-batches", action="store_true")
+    parser.add_argument("--no-augment", action="store_true")
+    parser.add_argument("--no-random-crop", action="store_true")
     parser.add_argument("--base-channels", type=int, default=48)
     parser.add_argument("--depths", type=str, default="2,2,4,2")
     parser.add_argument("--mlp-ratio", type=int, default=4)
@@ -120,15 +126,32 @@ def main() -> None:
         f"base_channels={args.base_channels}, depths={depths}, mlp_ratio={args.mlp_ratio}"
     )
 
-    train_dataset = ClassificationDataset(args.data_root, "train_labeled", args.image_size, args.max_train_samples)
-    val_dataset = ClassificationDataset(args.data_root, "val", args.image_size, args.max_val_samples)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
+    train_dataset = ClassificationDataset(
+        args.data_root,
+        args.split,
+        args.image_size,
+        args.max_train_samples,
+        augment=not args.no_augment,
+        random_crop=not args.no_random_crop,
+        include_seg_crops=args.include_seg_crops,
+        crop_padding=args.crop_padding,
     )
+    val_dataset = ClassificationDataset(args.data_root, "val", args.image_size, args.max_val_samples)
+    if args.balanced_class_batches:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=BalancedClassBatchSampler(train_dataset.samples, args.batch_size),
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,

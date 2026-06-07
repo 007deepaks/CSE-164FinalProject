@@ -343,3 +343,29 @@ classifier class predictions:
 ```powershell
 python -m src.training.predict_test --checkpoint outputs/checkpoints/best_segmentation.pt --data-root data/raw --class-csv outputs/predictions/test_class_predictions.csv --output outputs/submissions/submission.csv
 ```
+
+## Dedicated Classifier and Threshold Tuning
+
+The current multi-task segmentation model can learn foreground shape, but final
+semantic ids depend heavily on the classifier. This path trains a stronger
+classifier separately, then uses it for final submission class ids.
+
+Train on all supervised class labels, including mask-guided crops from
+`train_seg`:
+
+```powershell
+python -m src.training.train_classification --data-root data/raw --split train_combined --include-seg-crops --image-size 320 --epochs 60 --batch-size 32 --num-workers 4 --base-channels 96 --depths 3,3,9,3 --learning-rate 3e-4 --weight-decay 1e-4 --label-smoothing 0.0 --drop-path 0.0 --no-random-crop --balanced-class-batches --checkpoint-dir outputs/checkpoints/classifier_combined_crops
+```
+
+Tune the segmentation foreground threshold on validation:
+
+```powershell
+python -m src.training.tune_multitask_threshold --seg-checkpoint outputs/checkpoints/joint_from_warmup/best_multitask.pt --classifier-checkpoint outputs/checkpoints/classifier_combined_crops/best_classification.pt --data-root data/raw --image-size 320 --batch-size 4 --num-workers 4 --tta hflip
+```
+
+Generate a submission using the segmentation checkpoint for foreground masks
+and the dedicated classifier for class ids:
+
+```powershell
+python -m src.training.predict_multitask --checkpoint outputs/checkpoints/joint_from_warmup/best_multitask.pt --classifier-checkpoint outputs/checkpoints/classifier_combined_crops/best_classification.pt --data-root data/raw --image-size 320 --batch-size 4 --num-workers 4 --tta hflip --seg-threshold BEST_THRESHOLD --output outputs/submissions/seg_joint_classifier_crops_tta.csv
+```

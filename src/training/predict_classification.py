@@ -22,6 +22,7 @@ def predict(
     batch_size: int,
     num_workers: int,
     max_test_samples: int | None,
+    tta: str,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -53,6 +54,8 @@ def predict(
     for batch_index, batch in enumerate(loader, start=1):
         images = batch["image"].to(device, non_blocking=True)
         logits = model(images)
+        if tta == "hflip":
+            logits = 0.5 * (logits + model(torch.flip(images, dims=(-1,))))
         predictions = torch.argmax(logits, dim=1).cpu().tolist()
         for image_name, class_id in zip(batch["image_name"], predictions):
             rows.append({"image": str(image_name), "class_id": int(class_id)})
@@ -73,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-test-samples", type=int)
+    parser.add_argument("--tta", choices=["none", "hflip"], default="none")
     return parser.parse_args()
 
 
@@ -86,6 +90,7 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         max_test_samples=args.max_test_samples,
+        tta=args.tta,
     )
 
 
