@@ -87,6 +87,31 @@ def semantic_mask_from_logits(
     return mask, class_id
 
 
+def semantic_mask_from_binary_and_class_logits(
+    segmentation_logits: torch.Tensor,
+    classification_logits: torch.Tensor,
+    index: int,
+    height: int,
+    width: int,
+    seg_threshold: float | None = None,
+) -> tuple[np.ndarray, int]:
+    resized_logits = F.interpolate(
+        segmentation_logits[index : index + 1],
+        size=(height, width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    if seg_threshold is None:
+        binary_prediction = torch.argmax(resized_logits, dim=1).squeeze(0).cpu().numpy()
+    else:
+        foreground_probability = torch.softmax(resized_logits, dim=1)[:, 1]
+        binary_prediction = (foreground_probability.squeeze(0).cpu().numpy() > seg_threshold).astype(np.uint8)
+    class_id = int(torch.argmax(classification_logits[index]).detach().cpu().item())
+    mask = np.where(binary_prediction == 1, class_id + 1, 0).astype(np.uint16)
+    validate_prediction_mask(mask)
+    return mask, class_id
+
+
 @torch.no_grad()
 def validate_multitask(
     model: nn.Module,
@@ -95,8 +120,13 @@ def validate_multitask(
     device: torch.device,
     segmentation_criterion: nn.Module | None = None,
     classification_criterion: nn.Module | None = None,
+    classifier_model: nn.Module | None = None,
+    tta: str = "none",
+    seg_threshold: float | None = None,
 ) -> dict[str, float]:
     model.eval()
+    if classifier_model is not None:
+        classifier_model.eval()
     running_segmentation_loss = 0.0
     running_classification_loss = 0.0
     loss_batches = 0
@@ -119,7 +149,23 @@ def validate_multitask(
         outputs = model(images)
         segmentation_logits = outputs["segmentation"]
         classification_logits = outputs["classification"]
-        binary_predictions = torch.argmax(segmentation_logits, dim=1)
+        if classifier_model is not None:
+            classification_logits = classifier_model(images)
+        if tta == "hflip":
+            flipped_images = torch.flip(images, dims=(-1,))
+            flipped_outputs = model(flipped_images)
+            flipped_classification_logits = flipped_outputs["classification"]
+            if classifier_model is not None:
+                flipped_classification_logits = classifier_model(flipped_images)
+            segmentation_logits = 0.5 * (
+                segmentation_logits + torch.flip(flipped_outputs["segmentation"], dims=(-1,))
+            )
+            classification_logits = 0.5 * (classification_logits + flipped_classification_logits)
+        if seg_threshold is None:
+            binary_predictions = torch.argmax(segmentation_logits, dim=1)
+        else:
+            foreground_probability = torch.softmax(segmentation_logits, dim=1)[:, 1]
+            binary_predictions = (foreground_probability > seg_threshold).long()
         valid = masks != IGNORE_ID
         pred_fg = (binary_predictions == 1) & valid
         target_fg = (masks == 1) & valid
@@ -154,12 +200,13 @@ def validate_multitask(
         for item_index, image_name in enumerate(batch["image_name"]):
             height = int(batch["original_height"][item_index])
             width = int(batch["original_width"][item_index])
-            mask, class_id = semantic_mask_from_logits(
+            mask, class_id = semantic_mask_from_binary_and_class_logits(
                 segmentation_logits,
                 classification_logits,
                 item_index,
                 height,
                 width,
+                seg_threshold,
             )
             submission_rows.append(
                 {

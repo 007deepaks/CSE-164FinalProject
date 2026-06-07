@@ -11,7 +11,8 @@ from PIL import Image
 from torch.utils.data import DataLoader
 
 from src.data.segmentation_dataset import SegmentationDataset, TestImageDataset
-from src.training.multitask_utils import load_multitask_checkpoint, semantic_mask_from_logits
+from src.training.multitask_utils import load_multitask_checkpoint, semantic_mask_from_binary_and_class_logits
+from src.training.predict_multitask import load_classifier_checkpoint
 from src.utils.masks import IGNORE_ID, decode_rgb_mask
 
 
@@ -75,10 +76,14 @@ def visualize(
     image_size: int | None,
     num_samples: int,
     output_dir: Path,
+    classifier_checkpoint: Path | None,
+    tta: str,
+    seg_threshold: float | None,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _, saved_args = load_multitask_checkpoint(checkpoint_path, device)
     model.eval()
+    classifier_model = load_classifier_checkpoint(classifier_checkpoint, device) if classifier_checkpoint else None
     resolved_image_size = image_size or int(saved_args.get("image_size", 320))
     if split == "val":
         dataset = SegmentationDataset(
@@ -97,15 +102,32 @@ def visualize(
     for index, batch in enumerate(loader):
         images = batch["image"].to(device)
         outputs = model(images)
+        classification_logits = outputs["classification"]
+        if classifier_model is not None:
+            classification_logits = classifier_model(images)
+        if tta == "hflip":
+            flipped_images = torch.flip(images, dims=(-1,))
+            flipped_outputs = model(flipped_images)
+            flipped_classification_logits = flipped_outputs["classification"]
+            if classifier_model is not None:
+                flipped_classification_logits = classifier_model(flipped_images)
+            outputs = {
+                "segmentation": 0.5
+                * (outputs["segmentation"] + torch.flip(flipped_outputs["segmentation"], dims=(-1,))),
+                "classification": 0.5 * (classification_logits + flipped_classification_logits),
+            }
+        else:
+            outputs["classification"] = classification_logits
         height = int(batch["original_height"][0])
         width = int(batch["original_width"][0])
         image_name = str(batch["image_name"][0])
-        prediction, class_id = semantic_mask_from_logits(
+        prediction, class_id = semantic_mask_from_binary_and_class_logits(
             outputs["segmentation"],
             outputs["classification"],
             0,
             height,
             width,
+            seg_threshold,
         )
         panel = (
             make_val_panel(data_root, image_name, prediction)
@@ -125,6 +147,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int)
     parser.add_argument("--num-samples", type=int, default=12)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/figures"))
+    parser.add_argument("--classifier-checkpoint", type=Path)
+    parser.add_argument("--tta", choices=["none", "hflip"], default="none")
+    parser.add_argument("--seg-threshold", type=float)
     return parser.parse_args()
 
 
@@ -137,6 +162,9 @@ def main() -> None:
         image_size=args.image_size,
         num_samples=args.num_samples,
         output_dir=args.output_dir,
+        classifier_checkpoint=args.classifier_checkpoint,
+        tta=args.tta,
+        seg_threshold=args.seg_threshold,
     )
 
 

@@ -11,6 +11,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from src.data.segmentation_dataset import SegmentationDataset
+from src.training.predict_multitask import load_classifier_checkpoint
 from src.training.multitask_utils import load_multitask_checkpoint, validate_multitask
 from src.utils.masks import IGNORE_ID
 
@@ -23,9 +24,13 @@ def evaluate(
     batch_size: int,
     num_workers: int,
     max_val_samples: int | None,
+    classifier_checkpoint: Path | None,
+    tta: str,
+    seg_threshold: float | None,
 ) -> dict[str, float]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _, saved_args = load_multitask_checkpoint(checkpoint_path, device)
+    classifier_model = load_classifier_checkpoint(classifier_checkpoint, device) if classifier_checkpoint else None
     resolved_image_size = image_size or int(saved_args.get("image_size", 320))
     dataset = SegmentationDataset(
         data_root,
@@ -51,6 +56,9 @@ def evaluate(
         device,
         segmentation_criterion,
         classification_criterion,
+        classifier_model=classifier_model,
+        tta=tta,
+        seg_threshold=seg_threshold,
     )
 
 
@@ -62,6 +70,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-val-samples", type=int)
+    parser.add_argument("--classifier-checkpoint", type=Path)
+    parser.add_argument("--tta", choices=["none", "hflip"], default="none")
+    parser.add_argument("--seg-threshold", type=float)
     return parser.parse_args()
 
 
@@ -74,6 +85,9 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         max_val_samples=args.max_val_samples,
+        classifier_checkpoint=args.classifier_checkpoint,
+        tta=args.tta,
+        seg_threshold=args.seg_threshold,
     )
     print(json.dumps(metrics, indent=2, sort_keys=True))
 

@@ -7,16 +7,18 @@ import subprocess
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from src.data.segmentation_dataset import TestImageDataset
 from src.models.classification_model import build_classification_model, parse_depths
-from src.training.multitask_utils import load_multitask_checkpoint, semantic_mask_from_logits
+from src.training.multitask_utils import (
+    load_multitask_checkpoint,
+    semantic_mask_from_binary_and_class_logits,
+    semantic_mask_from_logits,
+)
 from src.utils.masks import NUM_CLASSES, encode_mask_to_rle, validate_prediction_mask
 
 
@@ -33,31 +35,6 @@ def load_classifier_checkpoint(checkpoint_path: Path, device: torch.device) -> n
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model
-
-
-def semantic_mask_from_binary_and_class_logits(
-    segmentation_logits: torch.Tensor,
-    classification_logits: torch.Tensor,
-    index: int,
-    height: int,
-    width: int,
-    seg_threshold: float | None,
-) -> tuple[np.ndarray, int]:
-    resized_logits = F.interpolate(
-        segmentation_logits[index : index + 1],
-        size=(height, width),
-        mode="bilinear",
-        align_corners=False,
-    )
-    if seg_threshold is None:
-        binary_prediction = torch.argmax(resized_logits, dim=1).squeeze(0).cpu().numpy()
-    else:
-        foreground_probability = torch.softmax(resized_logits, dim=1)[:, 1]
-        binary_prediction = (foreground_probability.squeeze(0).cpu().numpy() > seg_threshold).astype(np.uint8)
-    class_id = int(torch.argmax(classification_logits[index]).detach().cpu().item())
-    mask = np.where(binary_prediction == 1, class_id + 1, 0).astype(np.uint16)
-    validate_prediction_mask(mask)
-    return mask, class_id
 
 
 @torch.no_grad()
