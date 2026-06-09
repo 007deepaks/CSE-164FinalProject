@@ -419,6 +419,28 @@ prediction is the main bottleneck. Fine-tune the dedicated classifier with
 FixMatch using `train_unlabeled` while keeping supervised classification loss
 on `train_labeled + train_seg` labels and mask-guided crops.
 
+Prefer offline crop-aware pseudo-label mining before live FixMatch. Generate
+high-confidence pseudo-labels with the segmentation-guided crop teacher:
+
+```powershell
+python -m src.training.generate_pseudo_labels --seg-checkpoint outputs/checkpoints/joint_from_warmup/best_multitask.pt --classifier-checkpoint outputs/checkpoints/classifier_supervised_v2/best_ema_classification.pt --data-root data/raw --output outputs/pseudo_labels/crop_teacher_095_cap50.csv --image-size 320 --batch-size 4 --num-workers 4 --tta hflip --seg-threshold 0.90 --classifier-crop-mode seg --classifier-crop-padding 0.10 --classifier-crop-weight 0.50 --confidence-threshold 0.95 --max-per-class 50
+```
+
+Then fine-tune on real labels plus selected pseudo-labels with a conservative
+pseudo-label loss weight:
+
+```powershell
+python -m src.training.train_classification --data-root data/raw --resume-checkpoint outputs/checkpoints/classifier_supervised_v2/best_ema_classification.pt --split train_pseudo --pseudo-label-csv outputs/pseudo_labels/crop_teacher_095_cap50.csv --pseudo-sample-weight 0.35 --include-seg-crops --image-size 320 --epochs 12 --batch-size 24 --num-workers 2 --learning-rate 2e-5 --min-learning-rate 1e-6 --weight-decay 5e-2 --label-smoothing 0.05 --mixup-alpha 0.10 --cutmix-alpha 0.50 --mix-prob 0.30 --random-erasing-prob 0.15 --ema-decay 0.999 --grad-clip-norm 1.0 --no-random-crop --checkpoint-dir outputs/checkpoints/classifier_pseudo_crop_095
+```
+
+Evaluate, retune the crop-aware validation settings, then submit:
+
+```powershell
+python -m src.training.evaluate_classification --checkpoint outputs/checkpoints/classifier_pseudo_crop_095/best_ema_classification.pt --data-root data/raw --image-size 320 --batch-size 32 --num-workers 2 --tta hflip
+python -m src.training.tune_crop_classifier --seg-checkpoint outputs/checkpoints/joint_from_warmup/best_multitask.pt --classifier-checkpoint outputs/checkpoints/classifier_pseudo_crop_095/best_ema_classification.pt --data-root data/raw --image-size 320 --batch-size 4 --num-workers 4 --tta hflip --seg-thresholds 0.85,0.90,0.95 --crop-paddings 0.05,0.10,0.20 --crop-weights 0.30,0.50,0.70
+python -m src.training.predict_multitask --checkpoint outputs/checkpoints/joint_from_warmup/best_multitask.pt --classifier-checkpoint outputs/checkpoints/classifier_pseudo_crop_095/best_ema_classification.pt --data-root data/raw --image-size 320 --batch-size 4 --num-workers 4 --tta hflip --seg-threshold BEST_THRESHOLD --classifier-crop-mode seg --classifier-crop-padding BEST_PADDING --classifier-crop-weight BEST_WEIGHT --output outputs/submissions/pseudo_crop_teacher_tta.csv
+```
+
 Start with a high confidence threshold:
 
 ```powershell

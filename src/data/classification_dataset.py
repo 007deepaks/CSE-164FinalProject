@@ -25,6 +25,7 @@ class ClassificationSample:
     class_id: int | None = None
     mask_path: Path | None = None
     crop_mode: str = "full"
+    sample_weight: float = 1.0
 
 
 def _read_json(path: Path) -> object:
@@ -45,9 +46,11 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         augment_policy: str = "basic",
         include_seg_crops: bool = False,
         crop_padding: float = 0.15,
+        pseudo_label_csv: str | Path | None = None,
+        pseudo_sample_weight: float = 0.35,
     ) -> None:
-        if split not in {"train_labeled", "train_combined", "val", "test"}:
-            raise ValueError("split must be 'train_labeled', 'train_combined', 'val', or 'test'")
+        if split not in {"train_labeled", "train_combined", "train_pseudo", "val", "test"}:
+            raise ValueError("split must be 'train_labeled', 'train_combined', 'train_pseudo', 'val', or 'test'")
         if augment_policy not in {"basic", "strong"}:
             raise ValueError("augment_policy must be 'basic' or 'strong'")
         self.data_root = Path(data_root)
@@ -58,12 +61,14 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         self.augment_policy = augment_policy
         self.include_seg_crops = include_seg_crops
         self.crop_padding = crop_padding
+        self.pseudo_label_csv = Path(pseudo_label_csv) if pseudo_label_csv is not None else None
+        self.pseudo_sample_weight = pseudo_sample_weight
         self.samples = self._load_samples()
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
 
     def _load_samples(self) -> list[ClassificationSample]:
-        if self.split in {"train_labeled", "train_combined"}:
+        if self.split in {"train_labeled", "train_combined", "train_pseudo"}:
             labeled_rows = _read_json(self.data_root / "metadata" / "train_labeled.json")
             samples = [
                 ClassificationSample(
@@ -96,6 +101,10 @@ class ClassificationDataset(Dataset[dict[str, object]]):
                         )
                         for sample in seg_samples
                     )
+            if self.split == "train_pseudo":
+                if self.pseudo_label_csv is None:
+                    raise ValueError("split='train_pseudo' requires pseudo_label_csv")
+                samples.extend(self._load_pseudo_samples(self.pseudo_label_csv))
             return samples
 
         if self.split == "val":
@@ -118,6 +127,29 @@ class ClassificationDataset(Dataset[dict[str, object]]):
             )
             for image_path in image_paths
         ]
+
+    def _load_pseudo_samples(self, pseudo_label_csv: Path) -> list[ClassificationSample]:
+        import csv
+
+        pseudo_samples: list[ClassificationSample] = []
+        unlabeled_root = self.data_root / "train_unlabeled"
+        paths_by_name = {path.name: path for path in unlabeled_root.rglob("*") if path.is_file()}
+        with pseudo_label_csv.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                image_name = str(row["image"])
+                image_path = self.data_root / "train_unlabeled" / "images" / image_name
+                if not image_path.exists():
+                    image_path = paths_by_name[image_name]
+                pseudo_samples.append(
+                    ClassificationSample(
+                        image_path=image_path,
+                        image_name=image_name,
+                        class_id=int(row["class_id"]),
+                        sample_weight=self.pseudo_sample_weight,
+                    )
+                )
+        return pseudo_samples
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -144,6 +176,7 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         }
         if sample.class_id is not None:
             item["class_id"] = int(sample.class_id)
+            item["sample_weight"] = float(sample.sample_weight)
         return item
 
 

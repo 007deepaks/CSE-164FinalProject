@@ -19,8 +19,16 @@ from src.models.classification_model import build_classification_model, parse_de
 
 
 class SoftTargetCrossEntropy(nn.Module):
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return torch.mean(torch.sum(-targets * F.log_softmax(logits, dim=1), dim=1))
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        losses = torch.sum(-targets * F.log_softmax(logits, dim=1), dim=1)
+        if sample_weight is None:
+            return losses.mean()
+        return (losses * sample_weight).sum() / sample_weight.sum().clamp_min(1e-6)
 
 
 class ModelEma:
@@ -129,6 +137,9 @@ def train_one_epoch(
     for batch_index, batch in enumerate(loader, start=1):
         images = batch["image"].to(device, non_blocking=True)
         targets = batch["class_id"].to(device, non_blocking=True)
+        sample_weight = batch.get("sample_weight")
+        if sample_weight is not None:
+            sample_weight = sample_weight.to(device, non_blocking=True).float()
         images = random_erasing(images, args.random_erasing_prob)
         images, training_targets = maybe_apply_mixup_cutmix(
             images,
@@ -142,7 +153,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=use_amp):
             logits = model(images)
-            loss = criterion(logits, training_targets)
+            loss = criterion(logits, training_targets, sample_weight)
         scaler.scale(loss).backward()
         if args.grad_clip_norm > 0:
             scaler.unscale_(optimizer)
@@ -236,9 +247,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ema-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip-norm", type=float, default=0.0)
     parser.add_argument("--augment-policy", choices=["basic", "strong"], default="strong")
-    parser.add_argument("--split", choices=["train_labeled", "train_combined"], default="train_labeled")
+    parser.add_argument("--split", choices=["train_labeled", "train_combined", "train_pseudo"], default="train_labeled")
     parser.add_argument("--include-seg-crops", action="store_true")
     parser.add_argument("--crop-padding", type=float, default=0.15)
+    parser.add_argument("--pseudo-label-csv", type=Path)
+    parser.add_argument("--pseudo-sample-weight", type=float, default=0.35)
     parser.add_argument("--balanced-class-batches", action="store_true")
     parser.add_argument("--no-augment", action="store_true")
     parser.add_argument("--no-random-crop", action="store_true")
@@ -280,6 +293,8 @@ def main() -> None:
         augment_policy=args.augment_policy,
         include_seg_crops=args.include_seg_crops,
         crop_padding=args.crop_padding,
+        pseudo_label_csv=args.pseudo_label_csv,
+        pseudo_sample_weight=args.pseudo_sample_weight,
     )
     val_dataset = ClassificationDataset(args.data_root, "val", args.image_size, args.max_val_samples)
     if args.balanced_class_batches:
