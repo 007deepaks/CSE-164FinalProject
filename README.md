@@ -370,6 +370,34 @@ and the dedicated classifier for class ids:
 python -m src.training.predict_multitask --checkpoint outputs/checkpoints/joint_from_warmup/best_multitask.pt --classifier-checkpoint outputs/checkpoints/classifier_combined_crops/best_classification.pt --data-root data/raw --image-size 320 --batch-size 4 --num-workers 4 --tta hflip --seg-threshold BEST_THRESHOLD --output outputs/submissions/seg_joint_classifier_crops_tta.csv
 ```
 
+Supervised classifier v2 fine-tuning before returning to pseudo-labeling:
+
+```powershell
+python -m src.training.train_classification --data-root data/raw --resume-checkpoint outputs/checkpoints/classifier_combined_crops/best_classification.pt --split train_combined --include-seg-crops --image-size 320 --epochs 25 --batch-size 24 --num-workers 2 --learning-rate 5e-5 --min-learning-rate 1e-6 --weight-decay 5e-2 --label-smoothing 0.10 --mixup-alpha 0.20 --cutmix-alpha 1.00 --mix-prob 0.50 --random-erasing-prob 0.25 --ema-decay 0.999 --grad-clip-norm 1.0 --no-random-crop --checkpoint-dir outputs/checkpoints/classifier_supervised_v2
+```
+
+Evaluate the EMA classifier with hflip or multi-crop TTA:
+
+```powershell
+python -m src.training.evaluate_classification --checkpoint outputs/checkpoints/classifier_supervised_v2/best_ema_classification.pt --data-root data/raw --image-size 320 --batch-size 32 --num-workers 2 --tta hflip
+python -m src.training.evaluate_classification --checkpoint outputs/checkpoints/classifier_supervised_v2/best_ema_classification.pt --data-root data/raw --image-size 320 --batch-size 16 --num-workers 2 --tta multi_crop
+```
+
+Classifier checkpoints can be ensembled by listing multiple paths after one
+`--checkpoint` or `--classifier-checkpoint` flag:
+
+```powershell
+python -m src.training.evaluate_classification --checkpoint outputs/checkpoints/classifier_combined_crops/best_classification.pt outputs/checkpoints/classifier_supervised_v2/best_ema_classification.pt --data-root data/raw --image-size 320 --batch-size 16 --num-workers 2 --tta hflip
+```
+
+Retune the segmentation threshold and generate a submission with the improved
+classifier:
+
+```powershell
+python -m src.training.tune_multitask_threshold --seg-checkpoint outputs/checkpoints/joint_from_warmup/best_multitask.pt --classifier-checkpoint outputs/checkpoints/classifier_supervised_v2/best_ema_classification.pt --data-root data/raw --image-size 320 --batch-size 4 --num-workers 4 --tta hflip --thresholds 0.60,0.65,0.70,0.75,0.80,0.85,0.90
+python -m src.training.predict_multitask --checkpoint outputs/checkpoints/joint_from_warmup/best_multitask.pt --classifier-checkpoint outputs/checkpoints/classifier_supervised_v2/best_ema_classification.pt --data-root data/raw --image-size 320 --batch-size 4 --num-workers 4 --tta hflip --seg-threshold BEST_THRESHOLD --output outputs/submissions/supervised_v2_tta.csv
+```
+
 ## Classifier FixMatch on Unlabeled Images
 
 If the segmentation oracle mIoU is much higher than semantic mIoU, class

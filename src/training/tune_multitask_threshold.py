@@ -11,8 +11,12 @@ from torch.utils.data import DataLoader
 
 from starter.kaggle_metric import detailed_score
 from src.data.segmentation_dataset import SegmentationDataset
-from src.training.multitask_utils import build_val_solution_frame, load_multitask_checkpoint
-from src.training.predict_multitask import load_classifier_checkpoint, semantic_mask_from_binary_and_class_logits
+from src.training.classifier_utils import classifier_logits_with_tta, load_classifier_checkpoints
+from src.training.multitask_utils import (
+    build_val_solution_frame,
+    load_multitask_checkpoint,
+    semantic_mask_from_binary_and_class_logits,
+)
 from src.utils.masks import encode_mask_to_rle
 
 
@@ -26,7 +30,7 @@ def parse_thresholds(value: str) -> list[float]:
 @torch.no_grad()
 def score_thresholds(
     seg_checkpoint: Path,
-    classifier_checkpoint: Path | None,
+    classifier_checkpoints: list[Path] | None,
     data_root: Path,
     image_size: int,
     batch_size: int,
@@ -38,7 +42,7 @@ def score_thresholds(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seg_model, _, _ = load_multitask_checkpoint(seg_checkpoint, device)
     seg_model.eval()
-    classifier_model = load_classifier_checkpoint(classifier_checkpoint, device) if classifier_checkpoint else None
+    classifier_models = load_classifier_checkpoints(classifier_checkpoints, device)
     dataset = SegmentationDataset(
         data_root,
         split="val",
@@ -61,18 +65,18 @@ def score_thresholds(
         images = batch["image"].to(device, non_blocking=True)
         outputs = seg_model(images)
         classification_logits = outputs["classification"]
-        if classifier_model is not None:
-            classification_logits = classifier_model(images)
-        if tta == "hflip":
+        if classifier_models:
+            classification_logits = classifier_logits_with_tta(classifier_models, images, tta)
+        if tta in {"hflip", "multi_crop"}:
             flipped_images = torch.flip(images, dims=(-1,))
             flipped_outputs = seg_model(flipped_images)
             flipped_classification_logits = flipped_outputs["classification"]
-            if classifier_model is not None:
-                flipped_classification_logits = classifier_model(flipped_images)
+            if not classifier_models:
+                classification_logits = 0.5 * (classification_logits + flipped_classification_logits)
             outputs = {
                 "segmentation": 0.5
                 * (outputs["segmentation"] + torch.flip(flipped_outputs["segmentation"], dims=(-1,))),
-                "classification": 0.5 * (classification_logits + flipped_classification_logits),
+                "classification": classification_logits,
             }
         else:
             outputs["classification"] = classification_logits
@@ -122,14 +126,14 @@ def score_thresholds(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seg-checkpoint", type=Path, required=True)
-    parser.add_argument("--classifier-checkpoint", type=Path)
+    parser.add_argument("--classifier-checkpoint", type=Path, nargs="+")
     parser.add_argument("--data-root", type=Path, default=Path("data/raw"))
     parser.add_argument("--image-size", type=int, default=320)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--thresholds", type=str, default="0.45,0.50,0.55,0.60,0.65,0.70,0.75,0.80")
-    parser.add_argument("--tta", choices=["none", "hflip"], default="none")
+    parser.add_argument("--tta", choices=["none", "hflip", "multi_crop"], default="none")
     return parser.parse_args()
 
 
@@ -137,7 +141,7 @@ def main() -> None:
     args = parse_args()
     score_thresholds(
         seg_checkpoint=args.seg_checkpoint,
-        classifier_checkpoint=args.classifier_checkpoint,
+        classifier_checkpoints=args.classifier_checkpoint,
         data_root=args.data_root,
         image_size=args.image_size,
         batch_size=args.batch_size,

@@ -42,16 +42,20 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         max_samples: int | None = None,
         augment: bool = False,
         random_crop: bool = True,
+        augment_policy: str = "basic",
         include_seg_crops: bool = False,
         crop_padding: float = 0.15,
     ) -> None:
         if split not in {"train_labeled", "train_combined", "val", "test"}:
             raise ValueError("split must be 'train_labeled', 'train_combined', 'val', or 'test'")
+        if augment_policy not in {"basic", "strong"}:
+            raise ValueError("augment_policy must be 'basic' or 'strong'")
         self.data_root = Path(data_root)
         self.split = split
         self.image_size = image_size
         self.augment = augment
         self.random_crop = random_crop
+        self.augment_policy = augment_policy
         self.include_seg_crops = include_seg_crops
         self.crop_padding = crop_padding
         self.samples = self._load_samples()
@@ -125,11 +129,12 @@ class ClassificationDataset(Dataset[dict[str, object]]):
             if sample.crop_mode == "mask_crop":
                 image = crop_image_from_mask(image, sample.mask_path, self.crop_padding)
             original_size = image.size
-            image_tensor = (
-                augment_image_to_tensor(image, self.image_size, self.random_crop)
-                if self.augment
-                else image_to_tensor(image, self.image_size)
-            )
+            if self.augment and self.augment_policy == "strong":
+                image_tensor = strong_supervised_image_to_tensor(image, self.image_size, self.random_crop)
+            elif self.augment:
+                image_tensor = augment_image_to_tensor(image, self.image_size, self.random_crop)
+            else:
+                image_tensor = image_to_tensor(image, self.image_size)
 
         item: dict[str, object] = {
             "image": image_tensor,
@@ -140,6 +145,32 @@ class ClassificationDataset(Dataset[dict[str, object]]):
         if sample.class_id is not None:
             item["class_id"] = int(sample.class_id)
         return item
+
+
+def strong_supervised_image_to_tensor(
+    image: Image.Image,
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    random_crop: bool = True,
+) -> torch.Tensor:
+    """Controlled stronger supervised augmentation for tiny 300-way classifier data."""
+    image = image.convert("RGB")
+    if random_crop:
+        image = _random_square_crop(image)
+    image = image.resize((image_size, image_size), Image.Resampling.BILINEAR)
+    if random.random() < 0.5:
+        image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    image = ImageEnhance.Brightness(image).enhance(random.uniform(0.70, 1.30))
+    image = ImageEnhance.Contrast(image).enhance(random.uniform(0.70, 1.35))
+    image = ImageEnhance.Color(image).enhance(random.uniform(0.75, 1.30))
+    if random.random() < 0.12:
+        image = image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 0.7)))
+    if random.random() < 0.08:
+        image = ImageOps.grayscale(image).convert("RGB")
+    if random.random() < 0.06:
+        image = ImageOps.solarize(image, threshold=random.randint(112, 192))
+    if random.random() < 0.06:
+        image = ImageOps.posterize(image, bits=random.randint(4, 6))
+    return _normalize_image(image)
 
 
 class UnlabeledFixMatchDataset(Dataset[dict[str, object]]):

@@ -9,32 +9,16 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from torch import nn
 from torch.utils.data import DataLoader
 
 from src.data.segmentation_dataset import TestImageDataset
-from src.models.classification_model import build_classification_model, parse_depths
+from src.training.classifier_utils import classifier_logits_with_tta, load_classifier_checkpoints
 from src.training.multitask_utils import (
     load_multitask_checkpoint,
     semantic_mask_from_binary_and_class_logits,
     semantic_mask_from_logits,
 )
-from src.utils.masks import NUM_CLASSES, encode_mask_to_rle, validate_prediction_mask
-
-
-def load_classifier_checkpoint(checkpoint_path: Path, device: torch.device) -> nn.Module:
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    saved_args = checkpoint.get("args", {})
-    model = build_classification_model(
-        num_classes=NUM_CLASSES,
-        base_channels=int(saved_args.get("base_channels", 48)),
-        depths=parse_depths(str(saved_args.get("depths", "2,2,4,2"))),
-        mlp_ratio=int(saved_args.get("mlp_ratio", 4)),
-        drop_path=float(saved_args.get("drop_path", 0.0)),
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    return model
+from src.utils.masks import encode_mask_to_rle
 
 
 @torch.no_grad()
@@ -48,13 +32,13 @@ def predict(
     max_test_samples: int | None,
     validate_with_starter: bool,
     tta: str,
-    classifier_checkpoint: Path | None,
+    classifier_checkpoints: list[Path] | None,
     seg_threshold: float | None,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _, saved_args = load_multitask_checkpoint(checkpoint_path, device)
     model.eval()
-    classifier_model = load_classifier_checkpoint(classifier_checkpoint, device) if classifier_checkpoint else None
+    classifier_models = load_classifier_checkpoints(classifier_checkpoints, device)
     resolved_image_size = image_size or int(saved_args.get("image_size", 320))
     dataset = TestImageDataset(data_root, resolved_image_size, max_test_samples)
     loader = DataLoader(
@@ -70,14 +54,13 @@ def predict(
         images = batch["image"].to(device, non_blocking=True)
         outputs = model(images)
         classification_logits = outputs["classification"]
-        if classifier_model is not None:
-            classification_logits = classifier_model(images)
-        if tta == "hflip":
+        if classifier_models:
+            classification_logits = classifier_logits_with_tta(classifier_models, images, tta)
+        if tta in {"hflip", "multi_crop"}:
             flipped_outputs = model(torch.flip(images, dims=(-1,)))
             flipped_classification_logits = flipped_outputs["classification"]
-            if classifier_model is not None:
-                flipped_classification_logits = classifier_model(torch.flip(images, dims=(-1,)))
-            classification_logits = 0.5 * (classification_logits + flipped_classification_logits)
+            if not classifier_models:
+                classification_logits = 0.5 * (classification_logits + flipped_classification_logits)
             outputs = {
                 "classification": classification_logits,
                 "segmentation": 0.5
@@ -88,7 +71,7 @@ def predict(
         for item_index, image_name in enumerate(batch["image_name"]):
             height = int(batch["original_height"][item_index])
             width = int(batch["original_width"][item_index])
-            if seg_threshold is None and classifier_model is None:
+            if seg_threshold is None and not classifier_models:
                 mask, class_id = semantic_mask_from_logits(outputs["segmentation"], outputs["classification"], item_index, height, width)
             else:
                 mask, class_id = semantic_mask_from_binary_and_class_logits(
@@ -141,8 +124,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-test-samples", type=int)
     parser.add_argument("--no-validate", action="store_true")
-    parser.add_argument("--tta", choices=["none", "hflip"], default="none")
-    parser.add_argument("--classifier-checkpoint", type=Path)
+    parser.add_argument("--tta", choices=["none", "hflip", "multi_crop"], default="none")
+    parser.add_argument("--classifier-checkpoint", type=Path, nargs="+")
     parser.add_argument("--seg-threshold", type=float)
     return parser.parse_args()
 
@@ -159,7 +142,7 @@ def main() -> None:
         max_test_samples=args.max_test_samples,
         validate_with_starter=not args.no_validate,
         tta=args.tta,
-        classifier_checkpoint=args.classifier_checkpoint,
+        classifier_checkpoints=args.classifier_checkpoint,
         seg_threshold=args.seg_threshold,
     )
 

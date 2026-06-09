@@ -10,12 +10,12 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.data.classification_dataset import ClassificationDataset
-from src.models.classification_model import build_classification_model, parse_depths
+from src.training.classifier_utils import classifier_logits_with_tta, load_classifier_checkpoints
 
 
 @torch.no_grad()
 def predict(
-    checkpoint_path: Path,
+    checkpoint_paths: list[Path],
     data_root: Path,
     output_csv: Path,
     image_size: int,
@@ -25,13 +25,6 @@ def predict(
     tta: str,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    saved_args = checkpoint.get("args", {})
-    base_channels = int(saved_args.get("base_channels", 48))
-    depths = parse_depths(str(saved_args.get("depths", "2,2,4,2")))
-    mlp_ratio = int(saved_args.get("mlp_ratio", 4))
-    drop_path = float(saved_args.get("drop_path", 0.0))
-
     dataset = ClassificationDataset(data_root, "test", image_size, max_test_samples)
     loader = DataLoader(
         dataset,
@@ -40,22 +33,12 @@ def predict(
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
     )
-    model = build_classification_model(
-        num_classes=300,
-        base_channels=base_channels,
-        depths=depths,
-        mlp_ratio=mlp_ratio,
-        drop_path=drop_path,
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
+    models = load_classifier_checkpoints(checkpoint_paths, device)
 
     rows: list[dict[str, object]] = []
     for batch_index, batch in enumerate(loader, start=1):
         images = batch["image"].to(device, non_blocking=True)
-        logits = model(images)
-        if tta == "hflip":
-            logits = 0.5 * (logits + model(torch.flip(images, dims=(-1,))))
+        logits = classifier_logits_with_tta(models, images, tta)
         predictions = torch.argmax(logits, dim=1).cpu().tolist()
         for image_name, class_id in zip(batch["image_name"], predictions):
             rows.append({"image": str(image_name), "class_id": int(class_id)})
@@ -69,21 +52,26 @@ def predict(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, default=Path("outputs/checkpoints/best_classification.pt"))
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        nargs="+",
+        default=[Path("outputs/checkpoints/best_classification.pt")],
+    )
     parser.add_argument("--data-root", type=Path, default=Path("data/raw"))
     parser.add_argument("--output", type=Path, default=Path("outputs/predictions/test_class_predictions.csv"))
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-test-samples", type=int)
-    parser.add_argument("--tta", choices=["none", "hflip"], default="none")
+    parser.add_argument("--tta", choices=["none", "hflip", "multi_crop"], default="none")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     predict(
-        checkpoint_path=args.checkpoint,
+        checkpoint_paths=args.checkpoint,
         data_root=args.data_root,
         output_csv=args.output,
         image_size=args.image_size,
