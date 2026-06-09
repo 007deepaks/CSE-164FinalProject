@@ -12,7 +12,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.data.segmentation_dataset import TestImageDataset
-from src.training.classifier_utils import classifier_logits_with_tta, load_classifier_checkpoints
+from src.training.classifier_utils import (
+    classifier_logits_full_and_seg_crop,
+    classifier_logits_with_tta,
+    load_classifier_checkpoints,
+)
 from src.training.multitask_utils import (
     load_multitask_checkpoint,
     semantic_mask_from_binary_and_class_logits,
@@ -34,6 +38,9 @@ def predict(
     tta: str,
     classifier_checkpoints: list[Path] | None,
     seg_threshold: float | None,
+    classifier_crop_mode: str,
+    classifier_crop_padding: float,
+    classifier_crop_weight: float,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _, saved_args = load_multitask_checkpoint(checkpoint_path, device)
@@ -54,19 +61,30 @@ def predict(
         images = batch["image"].to(device, non_blocking=True)
         outputs = model(images)
         classification_logits = outputs["classification"]
-        if classifier_models:
-            classification_logits = classifier_logits_with_tta(classifier_models, images, tta)
         if tta in {"hflip", "multi_crop"}:
             flipped_outputs = model(torch.flip(images, dims=(-1,)))
             flipped_classification_logits = flipped_outputs["classification"]
-            if not classifier_models:
-                classification_logits = 0.5 * (classification_logits + flipped_classification_logits)
+            classification_logits = 0.5 * (classification_logits + flipped_classification_logits)
             outputs = {
                 "classification": classification_logits,
                 "segmentation": 0.5
                 * (outputs["segmentation"] + torch.flip(flipped_outputs["segmentation"], dims=(-1,))),
             }
         else:
+            outputs["classification"] = classification_logits
+        if classifier_models:
+            if classifier_crop_mode == "seg":
+                classification_logits = classifier_logits_full_and_seg_crop(
+                    classifier_models,
+                    images,
+                    outputs["segmentation"],
+                    tta=tta,
+                    crop_threshold=seg_threshold if seg_threshold is not None else 0.5,
+                    crop_padding=classifier_crop_padding,
+                    crop_weight=classifier_crop_weight,
+                )
+            else:
+                classification_logits = classifier_logits_with_tta(classifier_models, images, tta)
             outputs["classification"] = classification_logits
         for item_index, image_name in enumerate(batch["image_name"]):
             height = int(batch["original_height"][item_index])
@@ -127,6 +145,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tta", choices=["none", "hflip", "multi_crop"], default="none")
     parser.add_argument("--classifier-checkpoint", type=Path, nargs="+")
     parser.add_argument("--seg-threshold", type=float)
+    parser.add_argument("--classifier-crop-mode", choices=["none", "seg"], default="none")
+    parser.add_argument("--classifier-crop-padding", type=float, default=0.20)
+    parser.add_argument("--classifier-crop-weight", type=float, default=0.50)
     return parser.parse_args()
 
 
@@ -144,6 +165,9 @@ def main() -> None:
         tta=args.tta,
         classifier_checkpoints=args.classifier_checkpoint,
         seg_threshold=args.seg_threshold,
+        classifier_crop_mode=args.classifier_crop_mode,
+        classifier_crop_padding=args.classifier_crop_padding,
+        classifier_crop_weight=args.classifier_crop_weight,
     )
 
 

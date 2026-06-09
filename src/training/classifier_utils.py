@@ -61,6 +61,46 @@ def tta_views(images: torch.Tensor, tta: str) -> list[torch.Tensor]:
     raise ValueError(f"Unsupported TTA mode: {tta}")
 
 
+def foreground_crop_tensors(
+    images: torch.Tensor,
+    segmentation_logits: torch.Tensor,
+    threshold: float,
+    padding: float,
+) -> torch.Tensor:
+    """Crop normalized image tensors around predicted foreground and resize back."""
+    crop_tensors: list[torch.Tensor] = []
+    _, _, image_height, image_width = images.shape
+    foreground_probability = torch.softmax(segmentation_logits.float(), dim=1)[:, 1]
+    if foreground_probability.shape[-2:] != (image_height, image_width):
+        foreground_probability = F.interpolate(
+            foreground_probability.unsqueeze(1),
+            size=(image_height, image_width),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)
+    for index in range(images.shape[0]):
+        foreground = foreground_probability[index] > threshold
+        if not foreground.any():
+            crop_tensors.append(images[index])
+            continue
+        ys, xs = torch.where(foreground)
+        top = int(ys.min().item())
+        bottom = int(ys.max().item()) + 1
+        left = int(xs.min().item())
+        right = int(xs.max().item()) + 1
+        box_height = bottom - top
+        box_width = right - left
+        pad = int(round(max(box_height, box_width) * max(0.0, padding)))
+        top = max(0, top - pad)
+        left = max(0, left - pad)
+        bottom = min(image_height, bottom + pad)
+        right = min(image_width, right + pad)
+        crop = images[index : index + 1, :, top:bottom, left:right]
+        crop = F.interpolate(crop, size=(image_height, image_width), mode="bilinear", align_corners=False)
+        crop_tensors.append(crop.squeeze(0))
+    return torch.stack(crop_tensors, dim=0)
+
+
 @torch.no_grad()
 def classifier_logits_with_tta(
     models: list[nn.Module],
@@ -74,3 +114,20 @@ def classifier_logits_with_tta(
         for model in models:
             logits.append(model(view))
     return torch.stack(logits, dim=0).mean(dim=0)
+
+
+@torch.no_grad()
+def classifier_logits_full_and_seg_crop(
+    models: list[nn.Module],
+    images: torch.Tensor,
+    segmentation_logits: torch.Tensor,
+    tta: str,
+    crop_threshold: float,
+    crop_padding: float,
+    crop_weight: float,
+) -> torch.Tensor:
+    full_logits = classifier_logits_with_tta(models, images, tta)
+    crop_images = foreground_crop_tensors(images, segmentation_logits, crop_threshold, crop_padding)
+    crop_logits = classifier_logits_with_tta(models, crop_images, tta)
+    crop_weight = min(1.0, max(0.0, crop_weight))
+    return (1.0 - crop_weight) * full_logits + crop_weight * crop_logits

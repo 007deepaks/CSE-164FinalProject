@@ -398,6 +398,20 @@ python -m src.training.tune_multitask_threshold --seg-checkpoint outputs/checkpo
 python -m src.training.predict_multitask --checkpoint outputs/checkpoints/joint_from_warmup/best_multitask.pt --classifier-checkpoint outputs/checkpoints/classifier_supervised_v2/best_ema_classification.pt --data-root data/raw --image-size 320 --batch-size 4 --num-workers 4 --tta hflip --seg-threshold BEST_THRESHOLD --output outputs/submissions/supervised_v2_tta.csv
 ```
 
+Tune segmentation-guided classifier crops. This uses the segmentation model to
+crop the predicted foreground, classifies both the full image and crop, then
+blends their logits:
+
+```powershell
+python -m src.training.tune_crop_classifier --seg-checkpoint outputs/checkpoints/joint_from_warmup/best_multitask.pt --classifier-checkpoint outputs/checkpoints/classifier_supervised_v2/best_ema_classification.pt --data-root data/raw --image-size 320 --batch-size 4 --num-workers 4 --tta hflip --seg-thresholds 0.80,0.85,0.90,0.95 --crop-paddings 0.10,0.20,0.35,0.50 --crop-weights 0.30,0.50,0.70,0.90
+```
+
+Generate a crop-aware submission with the best validation settings:
+
+```powershell
+python -m src.training.predict_multitask --checkpoint outputs/checkpoints/joint_from_warmup/best_multitask.pt --classifier-checkpoint outputs/checkpoints/classifier_supervised_v2/best_ema_classification.pt --data-root data/raw --image-size 320 --batch-size 4 --num-workers 4 --tta hflip --seg-threshold BEST_THRESHOLD --classifier-crop-mode seg --classifier-crop-padding BEST_PADDING --classifier-crop-weight BEST_WEIGHT --output outputs/submissions/seg_crop_classifier_tta.csv
+```
+
 ## Classifier FixMatch on Unlabeled Images
 
 If the segmentation oracle mIoU is much higher than semantic mIoU, class
