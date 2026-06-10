@@ -70,7 +70,10 @@ def foreground_crop_tensors(
     """Crop normalized image tensors around predicted foreground and resize back."""
     crop_tensors: list[torch.Tensor] = []
     _, _, image_height, image_width = images.shape
-    foreground_probability = torch.softmax(segmentation_logits.float(), dim=1)[:, 1]
+    if segmentation_logits.shape[1] == 1:
+        foreground_probability = torch.sigmoid(segmentation_logits.float()[:, 0])
+    else:
+        foreground_probability = torch.softmax(segmentation_logits.float(), dim=1)[:, 1]
     if foreground_probability.shape[-2:] != (image_height, image_width):
         foreground_probability = F.interpolate(
             foreground_probability.unsqueeze(1),

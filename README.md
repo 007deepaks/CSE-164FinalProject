@@ -467,3 +467,34 @@ Generate a TTA submission with the best tuned threshold:
 ```powershell
 python -m src.training.predict_multitask --checkpoint outputs/checkpoints/joint_from_warmup/best_multitask.pt --classifier-checkpoint outputs/checkpoints/classifier_fixmatch_095/best_fixmatch_classification.pt --data-root data/raw --image-size 320 --batch-size 4 --num-workers 4 --tta hflip --seg-threshold BEST_THRESHOLD --output outputs/submissions/seg_joint_fixmatch_tta.csv
 ```
+## Unified ConvNeXt-Tiny U-Net Multi-Task Model
+
+The newer unified model uses a from-scratch ConvNeXt-Tiny encoder, a U-Net-style
+binary segmentation decoder, and a mask-guided classification head. The model
+returns the same dict as before, but supports `model(x, seg=False)` to skip the
+segmentation decoder for classification-only fast paths.
+
+Shape test:
+
+```powershell
+python tests/test_multitask_model_shapes.py
+```
+
+Tiny smoke run:
+
+```powershell
+python -m src.training.train_multitask --data-root data/raw --stage joint --epochs 1 --image-size 320 --model-size tiny --num-segmentation-classes 1 --decoder-type unet --seg-batch-size 1 --cls-batch-size 2 --val-batch-size 1 --max-seg-samples 4 --max-cls-samples 8 --max-val-samples 8 --learning-rate 1e-3 --weight-decay 5e-2 --label-smoothing 0.1 --gradient-clip 5.0 --checkpoint-dir outputs/checkpoints/unified_unet_smoke
+```
+
+Serious 1x V100 supervised run:
+
+```powershell
+python -m src.training.train_multitask --data-root data/raw --stage joint --epochs 100 --image-size 384 --model-size tiny --num-segmentation-classes 1 --decoder-type unet --seg-batch-size 4 --cls-batch-size 32 --val-batch-size 4 --num-workers 4 --learning-rate 8e-4 --min-learning-rate 1e-6 --weight-decay 5e-2 --label-smoothing 0.1 --segmentation-loss-weight 1.0 --dice-loss-weight 1.0 --seg-classification-loss-weight 1.0 --cls-loss-weight 1.0 --gradient-clip 5.0 --drop-path 0.05 --validation-thresholds 0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70 --checkpoint-dir outputs/checkpoints/unified_unet_tiny_384
+```
+
+Evaluate and predict with a tuned threshold:
+
+```powershell
+python -m src.training.evaluate_multitask --checkpoint outputs/checkpoints/unified_unet_tiny_384/best_multitask.pt --data-root data/raw --image-size 384 --batch-size 4 --num-workers 4 --seg-threshold BEST_THRESHOLD
+python -m src.training.predict_multitask --checkpoint outputs/checkpoints/unified_unet_tiny_384/best_multitask.pt --data-root data/raw --image-size 384 --batch-size 4 --num-workers 4 --tta hflip --seg-threshold BEST_THRESHOLD --output outputs/submissions/unified_unet_tiny_384.csv
+```

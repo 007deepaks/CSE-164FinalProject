@@ -25,6 +25,12 @@ def args_to_dict(args: argparse.Namespace) -> dict[str, object]:
 
 
 def checkpoint_model_kwargs(saved_args: dict[str, object]) -> dict[str, object]:
+    if "mask_guided_classifier" in saved_args:
+        mask_guided_classifier = _optional_bool(saved_args.get("mask_guided_classifier"), default=True)
+    elif "no_mask_guided_classifier" in saved_args:
+        mask_guided_classifier = not _optional_bool(saved_args.get("no_mask_guided_classifier"), default=False)
+    else:
+        mask_guided_classifier = False
     return {
         "model_size": str(saved_args.get("model_size", "small")),
         "base_channels": _optional_int(saved_args.get("base_channels")),
@@ -32,6 +38,9 @@ def checkpoint_model_kwargs(saved_args: dict[str, object]) -> dict[str, object]:
         "mlp_ratio": int(saved_args.get("mlp_ratio", 4)),
         "drop_path": float(saved_args.get("drop_path", 0.0)),
         "decoder_channels": _optional_int(saved_args.get("decoder_channels")),
+        "num_segmentation_classes": int(saved_args.get("num_segmentation_classes", 2)),
+        "decoder_type": str(saved_args.get("decoder_type", "fpn")),
+        "mask_guided_classifier": mask_guided_classifier,
     }
 
 
@@ -81,11 +90,54 @@ def semantic_mask_from_logits(
         mode="bilinear",
         align_corners=False,
     )
-    binary_prediction = torch.argmax(resized_logits, dim=1).squeeze(0).cpu().numpy()
+    binary_prediction = binary_prediction_from_logits(resized_logits, None).squeeze(0).cpu().numpy()
     class_id = int(torch.argmax(classification_logits[index]).detach().cpu().item())
     mask = np.where(binary_prediction == 1, class_id + 1, 0).astype(np.uint16)
     validate_prediction_mask(mask)
     return mask, class_id
+
+
+def foreground_probability_from_logits(segmentation_logits: torch.Tensor) -> torch.Tensor:
+    if segmentation_logits.shape[1] == 1:
+        return torch.sigmoid(segmentation_logits[:, 0])
+    return torch.softmax(segmentation_logits, dim=1)[:, 1]
+
+
+def binary_prediction_from_logits(
+    segmentation_logits: torch.Tensor,
+    seg_threshold: float | None = None,
+) -> torch.Tensor:
+    if segmentation_logits.shape[1] == 1:
+        threshold = 0.5 if seg_threshold is None else seg_threshold
+        return (torch.sigmoid(segmentation_logits[:, 0]) > threshold).long()
+    if seg_threshold is None:
+        return torch.argmax(segmentation_logits, dim=1)
+    return (torch.softmax(segmentation_logits, dim=1)[:, 1] > seg_threshold).long()
+
+
+def binary_segmentation_bce_loss(segmentation_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if segmentation_logits.shape[1] != 1:
+        return F.cross_entropy(segmentation_logits, target, ignore_index=IGNORE_ID)
+    valid = target != IGNORE_ID
+    if not valid.any():
+        return segmentation_logits.sum() * 0.0
+    binary_target = ((target > 0) & valid).float()
+    loss = F.binary_cross_entropy_with_logits(
+        segmentation_logits[:, 0],
+        binary_target,
+        reduction="none",
+    )
+    return loss[valid].mean()
+
+
+def binary_segmentation_dice_loss(segmentation_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    valid = target != IGNORE_ID
+    foreground = ((target > 0) & valid).float()
+    foreground_probability = foreground_probability_from_logits(segmentation_logits)
+    valid_float = valid.float()
+    intersection = (foreground_probability * foreground * valid_float).sum()
+    denominator = ((foreground_probability + foreground) * valid_float).sum()
+    return 1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)
 
 
 def semantic_mask_from_binary_and_class_logits(
@@ -102,11 +154,12 @@ def semantic_mask_from_binary_and_class_logits(
         mode="bilinear",
         align_corners=False,
     )
-    if seg_threshold is None:
-        binary_prediction = torch.argmax(resized_logits, dim=1).squeeze(0).cpu().numpy()
-    else:
-        foreground_probability = torch.softmax(resized_logits, dim=1)[:, 1]
-        binary_prediction = (foreground_probability.squeeze(0).cpu().numpy() > seg_threshold).astype(np.uint8)
+    binary_prediction = binary_prediction_from_logits(resized_logits, seg_threshold).squeeze(0).cpu().numpy()
+    if binary_prediction.sum() == 0:
+        foreground_probability = foreground_probability_from_logits(resized_logits).squeeze(0)
+        flat_index = int(torch.argmax(foreground_probability).cpu().item())
+        y, x = divmod(flat_index, width)
+        binary_prediction[y, x] = 1
     class_id = int(torch.argmax(classification_logits[index]).detach().cpu().item())
     mask = np.where(binary_prediction == 1, class_id + 1, 0).astype(np.uint16)
     validate_prediction_mask(mask)
@@ -162,11 +215,7 @@ def validate_multitask(
             segmentation_logits = 0.5 * (
                 segmentation_logits + torch.flip(flipped_outputs["segmentation"], dims=(-1,))
             )
-        if seg_threshold is None:
-            binary_predictions = torch.argmax(segmentation_logits, dim=1)
-        else:
-            foreground_probability = torch.softmax(segmentation_logits, dim=1)[:, 1]
-            binary_predictions = (foreground_probability > seg_threshold).long()
+        binary_predictions = binary_prediction_from_logits(segmentation_logits, seg_threshold)
         valid = masks != IGNORE_ID
         pred_fg = (binary_predictions == 1) & valid
         target_fg = (masks == 1) & valid
@@ -245,3 +294,11 @@ def _optional_str(value: object) -> str | None:
     if value in {None, "", "None"}:
         return None
     return str(value)
+
+
+def _optional_bool(value: object, default: bool) -> bool:
+    if value in {None, "", "None"}:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in {"1", "true", "yes", "y"}

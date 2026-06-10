@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 
 from src.data.segmentation_dataset import SegmentationDataset
 from src.training.classifier_utils import load_classifier_checkpoints
-from src.training.multitask_utils import load_multitask_checkpoint, validate_multitask
+from src.training.multitask_utils import binary_segmentation_bce_loss, load_multitask_checkpoint, validate_multitask
 from src.utils.masks import IGNORE_ID
 
 
@@ -47,7 +47,10 @@ def evaluate(
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
     )
-    segmentation_criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_ID)
+    if int(saved_args.get("num_segmentation_classes", 2)) == 1:
+        segmentation_criterion = binary_segmentation_bce_loss
+    else:
+        segmentation_criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_ID)
     classification_criterion = nn.CrossEntropyLoss()
     return validate_multitask(
         model,

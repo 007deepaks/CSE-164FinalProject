@@ -83,7 +83,58 @@ def _jitter_image(image: Image.Image) -> Image.Image:
     image = ImageEnhance.Color(image).enhance(color)
     if random.random() < 0.10:
         image = image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 0.8)))
+    if random.random() < 0.10:
+        array = np.asarray(image, dtype=np.int16)
+        noise = np.random.normal(0, random.uniform(2.0, 8.0), size=array.shape)
+        array = np.clip(array + noise, 0, 255).astype(np.uint8)
+        image = Image.fromarray(array, mode="RGB")
     return image
+
+
+def _resize_random_crop_pair(
+    image: Image.Image,
+    mask_image: Image.Image,
+    image_size: int,
+) -> tuple[Image.Image, Image.Image]:
+    resize_size = int(round(image_size * 1.14))
+    image = image.resize((resize_size, resize_size), Image.Resampling.BILINEAR)
+    mask_image = mask_image.resize((resize_size, resize_size), Image.Resampling.NEAREST)
+
+    if random.random() < 0.75:
+        angle = random.uniform(-10.0, 10.0)
+        scale = random.uniform(0.90, 1.10)
+        translate_x = random.uniform(-0.05, 0.05) * resize_size
+        translate_y = random.uniform(-0.05, 0.05) * resize_size
+        center = resize_size * 0.5
+        radians = np.deg2rad(angle)
+        cos_value = np.cos(radians) / scale
+        sin_value = np.sin(radians) / scale
+        a = cos_value
+        b = sin_value
+        d = -sin_value
+        e = cos_value
+        c = center - a * center - b * center - translate_x
+        f = center - d * center - e * center - translate_y
+        affine = (a, b, c, d, e, f)
+        image = image.transform(
+            (resize_size, resize_size),
+            Image.Transform.AFFINE,
+            affine,
+            resample=Image.Resampling.BILINEAR,
+            fillcolor=(0, 0, 0),
+        )
+        mask_image = mask_image.transform(
+            (resize_size, resize_size),
+            Image.Transform.AFFINE,
+            affine,
+            resample=Image.Resampling.NEAREST,
+            fillcolor=1000,
+        )
+
+    left = random.randint(0, resize_size - image_size)
+    top = random.randint(0, resize_size - image_size)
+    crop_box = (left, top, left + image_size, top + image_size)
+    return image.crop(crop_box), mask_image.crop(crop_box)
 
 
 def augment_image_to_tensor(
@@ -114,13 +165,10 @@ def augment_image_and_mask_to_tensors(
     image = image.convert("RGB")
     mask_image = Image.fromarray(mask.astype(np.int32), mode="I")
     if random_crop:
-        width, height = image.size
-        left, top, crop_width, crop_height = _random_resized_crop_params(width, height)
-        crop_box = (left, top, left + crop_width, top + crop_height)
-        image = image.crop(crop_box)
-        mask_image = mask_image.crop(crop_box)
-    image = image.resize((image_size, image_size), Image.Resampling.BILINEAR)
-    mask_image = mask_image.resize((image_size, image_size), Image.Resampling.NEAREST)
+        image, mask_image = _resize_random_crop_pair(image, mask_image, image_size)
+    else:
+        image = image.resize((image_size, image_size), Image.Resampling.BILINEAR)
+        mask_image = mask_image.resize((image_size, image_size), Image.Resampling.NEAREST)
     if random.random() < 0.5:
         image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
         mask_image = mask_image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)

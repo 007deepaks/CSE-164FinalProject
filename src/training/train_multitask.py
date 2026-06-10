@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from pathlib import Path
 
@@ -14,18 +15,60 @@ from torch.utils.data import DataLoader
 from src.data.classification_dataset import BalancedClassBatchSampler, ClassificationDataset
 from src.data.segmentation_dataset import SegmentationDataset
 from src.models.multitask_model import MODEL_CONFIGS, build_multitask_model, resolve_model_config
-from src.training.multitask_utils import args_to_dict, validate_multitask
+from src.training.multitask_utils import (
+    args_to_dict,
+    binary_segmentation_bce_loss,
+    binary_prediction_from_logits,
+    binary_segmentation_dice_loss,
+    validate_multitask,
+)
 from src.utils.masks import IGNORE_ID, NUM_CLASSES
 
 
-def dice_loss(segmentation_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    valid = target != IGNORE_ID
-    foreground = (target == 1).float()
-    foreground_probability = torch.softmax(segmentation_logits, dim=1)[:, 1]
-    valid_float = valid.float()
-    intersection = (foreground_probability * foreground * valid_float).sum()
-    denominator = ((foreground_probability + foreground) * valid_float).sum()
-    return 1.0 - (2.0 * intersection + 1.0) / (denominator + 1.0)
+def parse_float_list(value: str) -> list[float]:
+    return [float(part.strip()) for part in value.split(",") if part.strip()]
+
+
+class ModelEma:
+    def __init__(self, model: nn.Module, decay: float) -> None:
+        self.module = copy.deepcopy(model).eval()
+        self.decay = decay
+        self.num_updates = 0
+        for parameter in self.module.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        self.num_updates += 1
+        decay = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+        model_state = model.state_dict()
+        for name, ema_value in self.module.state_dict().items():
+            model_value = model_state[name].detach()
+            if ema_value.dtype.is_floating_point:
+                ema_value.mul_(decay).add_(model_value, alpha=1.0 - decay)
+            else:
+                ema_value.copy_(model_value)
+
+
+def build_warmup_cosine_scheduler(
+    optimizer: torch.optim.Optimizer,
+    epochs: int,
+    warmup_epochs: int,
+    min_lr: float,
+    base_lr: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    warmup_epochs = max(0, min(warmup_epochs, max(0, epochs - 1)))
+    min_lr_ratio = min_lr / base_lr if base_lr > 0 else 0.0
+
+    def lr_lambda(epoch_index: int) -> float:
+        if warmup_epochs > 0 and epoch_index < warmup_epochs:
+            return float(epoch_index + 1) / float(warmup_epochs)
+        cosine_epochs = max(1, epochs - warmup_epochs)
+        progress = min(1.0, max(0.0, (epoch_index - warmup_epochs) / cosine_epochs))
+        cosine = 0.5 * (1.0 + torch.cos(torch.tensor(progress * torch.pi)).item())
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 def train_segmentation_batches(
@@ -41,6 +84,7 @@ def train_segmentation_batches(
     dice_loss_weight: float,
     seg_classification_loss_weight: float,
     gradient_clip: float,
+    ema: ModelEma | None = None,
 ) -> dict[str, float]:
     model.train()
     totals = {
@@ -59,7 +103,7 @@ def train_segmentation_batches(
             outputs = model(images)
             ce = segmentation_criterion(outputs["segmentation"], masks)
             class_loss = classification_criterion(outputs["classification"], class_ids)
-        dice = dice_loss(outputs["segmentation"].float(), masks)
+        dice = binary_segmentation_dice_loss(outputs["segmentation"].float(), masks)
         loss = (
             segmentation_loss_weight * ce
             + dice_loss_weight * dice
@@ -88,6 +132,8 @@ def train_segmentation_batches(
                 continue
         scaler.step(optimizer)
         scaler.update()
+        if ema is not None:
+            ema.update(model)
 
         totals["segmentation_ce_loss"] += float(ce.item())
         totals["segmentation_dice_loss"] += float(dice.item())
@@ -113,6 +159,7 @@ def train_classification_batches(
     cls_loss_weight: float,
     gradient_clip: float,
     metric_prefix: str = "classification_train",
+    ema: ModelEma | None = None,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -143,6 +190,8 @@ def train_classification_batches(
                 continue
         scaler.step(optimizer)
         scaler.update()
+        if ema is not None:
+            ema.update(model)
         total_loss += float(raw_loss.item())
         predictions = torch.argmax(outputs["classification"].detach(), dim=1)
         correct += int((predictions == class_ids).sum().item())
@@ -172,6 +221,7 @@ def train_joint_mixed_batches(
     seg_classification_loss_weight: float,
     cls_loss_weight: float,
     gradient_clip: float,
+    ema: ModelEma | None = None,
 ) -> dict[str, float]:
     model.train()
     totals = {
@@ -219,7 +269,7 @@ def train_joint_mixed_batches(
             ce = segmentation_criterion(seg_outputs["segmentation"], masks)
             seg_class_loss = classification_criterion(seg_outputs["classification"], seg_class_ids)
             cls_loss = classification_criterion(cls_outputs["classification"], cls_class_ids)
-        dice = dice_loss(seg_outputs["segmentation"].float(), masks)
+        dice = binary_segmentation_dice_loss(seg_outputs["segmentation"].float(), masks)
         seg_total = segmentation_loss_weight * ce + dice_loss_weight * dice + seg_classification_loss_weight * seg_class_loss
         loss = seg_total + cls_loss_weight * cls_loss
 
@@ -248,6 +298,8 @@ def train_joint_mixed_batches(
                 continue
         scaler.step(optimizer)
         scaler.update()
+        if ema is not None:
+            ema.update(model)
 
         completed_steps += 1
         totals["segmentation_ce_loss"] += float(ce.item())
@@ -307,7 +359,7 @@ def compute_debug_train_metrics(
         semantic_masks = batch["semantic_mask"].to(device, non_blocking=True)
         class_ids = batch["class_id"].to(device, non_blocking=True)
         outputs = model(images)
-        binary_prediction = torch.argmax(outputs["segmentation"], dim=1)
+        binary_prediction = binary_prediction_from_logits(outputs["segmentation"], None)
         class_prediction = torch.argmax(outputs["classification"], dim=1)
         valid = masks != IGNORE_ID
         pred_fg = (binary_prediction == 1) & valid
@@ -371,7 +423,10 @@ def save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "best_automated_score": best_score,
-            "args": args_to_dict(args),
+            "args": {
+                **args_to_dict(args),
+                "mask_guided_classifier": not getattr(args, "no_mask_guided_classifier", False),
+            },
         },
         path,
     )
@@ -408,12 +463,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seg-classification-loss-weight", type=float, default=0.5)
     parser.add_argument("--cls-loss-weight", type=float, default=0.5)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
+    parser.add_argument("--ema-decay", type=float, default=0.9998)
+    parser.add_argument("--no-ema", action="store_true")
     parser.add_argument("--model-size", choices=sorted(MODEL_CONFIGS), default="small")
     parser.add_argument("--base-channels", type=int)
     parser.add_argument("--depths", type=str)
     parser.add_argument("--mlp-ratio", type=int, default=4)
     parser.add_argument("--drop-path", type=float, default=0.05)
     parser.add_argument("--decoder-channels", type=int)
+    parser.add_argument("--num-segmentation-classes", type=int, default=1)
+    parser.add_argument("--decoder-type", choices=["unet", "fpn"], default="unet")
+    parser.add_argument("--no-mask-guided-classifier", action="store_true")
     parser.add_argument("--max-seg-samples", type=int)
     parser.add_argument("--max-cls-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
@@ -422,6 +482,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validate-every", type=int, default=1)
     parser.add_argument("--full-val-every", type=int, default=1)
     parser.add_argument("--quick-val-samples", type=int)
+    parser.add_argument("--validation-thresholds", type=str, default="0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70")
     parser.add_argument(
         "--no-random-crop",
         action="store_true",
@@ -543,26 +604,46 @@ def run_one_stage(args: argparse.Namespace) -> Path:
         mlp_ratio=args.mlp_ratio,
         drop_path=args.drop_path,
         decoder_channels=args.decoder_channels,
+        num_segmentation_classes=args.num_segmentation_classes,
+        decoder_type=args.decoder_type,
+        mask_guided_classifier=not args.no_mask_guided_classifier,
     ).to(device)
     if args.resume_checkpoint is not None:
         load_model_weights(args.resume_checkpoint, model, device)
-    seg_weights = torch.tensor(
-        [args.background_weight, args.foreground_weight],
-        dtype=torch.float32,
-        device=device,
-    )
-    segmentation_criterion = nn.CrossEntropyLoss(weight=seg_weights, ignore_index=IGNORE_ID)
+    if args.num_segmentation_classes == 1:
+        segmentation_criterion = binary_segmentation_bce_loss
+    else:
+        seg_weights = torch.tensor(
+            [args.background_weight, args.foreground_weight],
+            dtype=torch.float32,
+            device=device,
+        )
+        segmentation_criterion = nn.CrossEntropyLoss(weight=seg_weights, ignore_index=IGNORE_ID)
     classification_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    scheduler = build_warmup_cosine_scheduler(
         optimizer,
-        T_max=max(2, args.epochs),
-        eta_min=args.min_learning_rate,
+        epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+        min_lr=args.min_learning_rate,
+        base_lr=args.learning_rate,
     )
+    if args.warmup_epochs > 0:
+        first_epoch_lr = args.learning_rate / max(1, min(args.warmup_epochs, max(1, args.epochs - 1)))
+        for group in optimizer.param_groups:
+            group["lr"] = first_epoch_lr
+        print(
+            f"LR scheduler: linear warmup for {args.warmup_epochs} epochs "
+            f"to {args.learning_rate:g}, then cosine decay to {args.min_learning_rate:g}"
+        )
+    else:
+        print(f"LR scheduler: cosine decay from {args.learning_rate:g} to {args.min_learning_rate:g}")
     scaler = GradScaler(enabled=use_amp)
+    ema = None if args.no_ema else ModelEma(model, args.ema_decay)
     best_score = -1.0
     history: list[dict[str, float]] = []
     print(f"Training stage: {args.stage}")
+    validation_thresholds = parse_float_list(args.validation_thresholds)
 
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
@@ -584,6 +665,7 @@ def run_one_stage(args: argparse.Namespace) -> Path:
                 use_amp,
                 args.seg_classification_loss_weight,
                 args.gradient_clip,
+                ema=ema,
                 metric_prefix="seg_classification_train",
             )
         else:
@@ -602,6 +684,7 @@ def run_one_stage(args: argparse.Namespace) -> Path:
                 args.seg_classification_loss_weight,
                 args.cls_loss_weight,
                 args.gradient_clip,
+                ema=ema,
             )
             seg_metrics = {
                 "segmentation_ce_loss": mixed_metrics["segmentation_ce_loss"],
@@ -631,6 +714,7 @@ def run_one_stage(args: argparse.Namespace) -> Path:
                 use_amp,
                 args.cls_loss_weight,
                 args.gradient_clip,
+                ema=ema,
                 metric_prefix="classification_train",
             )
         should_validate = epoch % max(1, args.validate_every) == 0 or epoch == args.epochs
@@ -640,14 +724,21 @@ def run_one_stage(args: argparse.Namespace) -> Path:
         if should_validate:
             validation_loader = val_loader if should_full_validate or quick_val_loader is None else quick_val_loader
             validation_kind = "full" if validation_loader is val_loader else "quick"
-            val_metrics = validate_multitask(
-                model,
-                validation_loader,
-                args.data_root,
-                device,
-                segmentation_criterion,
-                classification_criterion,
-            )
+            threshold_metrics = []
+            validation_model = ema.module if ema is not None else model
+            for threshold in validation_thresholds:
+                metrics = validate_multitask(
+                    validation_model,
+                    validation_loader,
+                    args.data_root,
+                    device,
+                    segmentation_criterion,
+                    classification_criterion,
+                    seg_threshold=threshold,
+                )
+                metrics["seg_threshold"] = float(threshold)
+                threshold_metrics.append(metrics)
+            val_metrics = max(threshold_metrics, key=lambda item: item["automated_score"])
         else:
             val_metrics = {
                 "automated_score": 0.0,
@@ -658,6 +749,7 @@ def run_one_stage(args: argparse.Namespace) -> Path:
                 "boundary_f_score": 0.0,
                 "rare_class_miou": 0.0,
                 "classification_macro_accuracy": 0.0,
+                "seg_threshold": 0.0,
             }
         debug_metrics = (
             compute_debug_train_metrics(model, seg_loader, cls_loader, device)
@@ -691,6 +783,7 @@ def run_one_stage(args: argparse.Namespace) -> Path:
             f"boundary={row['boundary_f_score']:.4f} "
             f"rare_mIoU={row['rare_class_miou']:.4f} "
             f"macro_acc={row['classification_macro_accuracy']:.4f} "
+            f"thr={row['seg_threshold']:.2f} "
             f"lr={current_lr:.6f}"
         )
         if args.debug_overfit:
@@ -723,7 +816,7 @@ def run_one_stage(args: argparse.Namespace) -> Path:
             best_score = selection_metric
             save_checkpoint(
                 args.checkpoint_dir / "best_multitask.pt",
-                model,
+                ema.module if ema is not None else model,
                 optimizer,
                 scheduler,
                 epoch,
