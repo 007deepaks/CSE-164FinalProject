@@ -1,4 +1,4 @@
-"""Train a shared ConvNeXt multi-task classifier and binary segmenter."""
+"""Train a shared multi-task classifier and binary segmenter."""
 
 from __future__ import annotations
 
@@ -10,11 +10,12 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from src.data.classification_dataset import BalancedClassBatchSampler, ClassificationDataset
 from src.data.segmentation_dataset import SegmentationDataset
 from src.models.multitask_model import MODEL_CONFIGS, build_multitask_model, resolve_model_config
+from src.models.multitaskResnet50 import build_resnet50_multitask_model
 from src.training.multitask_utils import (
     args_to_dict,
     binary_segmentation_bce_loss,
@@ -69,6 +70,15 @@ def build_warmup_cosine_scheduler(
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def build_sample_weights(samples: list[object], class_only_weight: float, mask_weight: float) -> list[float]:
+    weights: list[float] = []
+    for sample in samples:
+        mask_path = getattr(sample, "mask_path", None)
+        crop_mode = getattr(sample, "crop_mode", "full")
+        weights.append(mask_weight if mask_path is not None and crop_mode == "full" else class_only_weight)
+    return weights
 
 
 def train_segmentation_batches(
@@ -171,7 +181,7 @@ def train_classification_batches(
         class_ids = batch["class_id"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=use_amp):
-            outputs = model(images, seg=False)
+            outputs = model(images, seg=True)
             raw_loss = classification_criterion(outputs["classification"], class_ids)
             loss = cls_loss_weight * raw_loss
         if not torch.isfinite(raw_loss.detach()).all() or not torch.isfinite(loss.detach()).all():
@@ -265,7 +275,7 @@ def train_joint_mixed_batches(
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=use_amp):
             seg_outputs = model(seg_images, seg=True)
-            cls_outputs = model(cls_images, seg=False)
+            cls_outputs = model(cls_images, seg=True)
             ce = segmentation_criterion(seg_outputs["segmentation"], masks)
             seg_class_loss = classification_criterion(seg_outputs["classification"], seg_class_ids)
             cls_loss = classification_criterion(cls_outputs["classification"], cls_class_ids)
@@ -388,7 +398,7 @@ def compute_debug_train_metrics(
     for batch in cls_loader:
         images = batch["image"].to(device, non_blocking=True)
         class_ids = batch["class_id"].to(device, non_blocking=True)
-        outputs = model(images, seg=False)
+        outputs = model(images, seg=True)
         class_prediction = torch.argmax(outputs["classification"], dim=1)
         cls_correct += int((class_prediction == class_ids).sum().item())
         cls_total += int(class_ids.numel())
@@ -456,6 +466,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--stage", choices=["classifier_warmup", "joint", "warmup_joint"], default="joint")
     parser.add_argument("--resume-checkpoint", type=Path)
+    parser.add_argument("--architecture", choices=["convnext", "resnet50"], default="convnext")
     parser.add_argument("--background-weight", type=float, default=0.05)
     parser.add_argument("--foreground-weight", type=float, default=1.0)
     parser.add_argument("--segmentation-loss-weight", type=float, default=1.0)
@@ -474,11 +485,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-segmentation-classes", type=int, default=1)
     parser.add_argument("--decoder-type", choices=["unet", "fpn"], default="unet")
     parser.add_argument("--no-mask-guided-classifier", action="store_true")
+    parser.add_argument("--resnet-classifier-dropout", type=float, default=0.2)
     parser.add_argument("--max-seg-samples", type=int)
     parser.add_argument("--max-cls-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("outputs/checkpoints"))
     parser.add_argument("--balanced-class-batches", action="store_true")
+    parser.add_argument("--weighted-combined-sampling", action="store_true")
+    parser.add_argument("--class-only-sample-weight", type=float, default=1.0)
+    parser.add_argument("--mask-sample-weight", type=float, default=2.5)
     parser.add_argument("--validate-every", type=int, default=1)
     parser.add_argument("--full-val-every", type=int, default=1)
     parser.add_argument("--quick-val-samples", type=int)
@@ -516,14 +531,22 @@ def run_one_stage(args: argparse.Namespace) -> Path:
         print("DEBUG OVERFIT: using 8 segmentation samples, 32 classification samples, no augmentation.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
-    resolved = resolve_model_config(args.model_size, args.base_channels, args.depths, args.decoder_channels)
     print(f"Using device: {device}; mixed precision: {use_amp}")
-    print(
-        "Multi-task ConvNeXt from scratch: "
-        f"model_size={args.model_size}, image_size={args.image_size}, "
-        f"base_channels={resolved['base_channels']}, depths={resolved['depths']}, "
-        f"decoder_channels={resolved['decoder_channels']}"
-    )
+    if args.architecture == "convnext":
+        resolved = resolve_model_config(args.model_size, args.base_channels, args.depths, args.decoder_channels)
+        print(
+            "Multi-task ConvNeXt from scratch: "
+            f"model_size={args.model_size}, image_size={args.image_size}, "
+            f"base_channels={resolved['base_channels']}, depths={resolved['depths']}, "
+            f"decoder_channels={resolved['decoder_channels']}"
+        )
+    else:
+        print(
+            "Multi-task ResNet-50 from scratch: "
+            f"image_size={args.image_size}, decoder=unet, "
+            f"num_segmentation_classes={args.num_segmentation_classes}, "
+            f"classifier_dropout={args.resnet_classifier_dropout}"
+        )
 
     seg_train = SegmentationDataset(
         args.data_root,
@@ -557,11 +580,31 @@ def run_one_stage(args: argparse.Namespace) -> Path:
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
+    if args.balanced_class_batches and args.weighted_combined_sampling:
+        raise ValueError("--balanced-class-batches and --weighted-combined-sampling cannot both be enabled")
     if args.balanced_class_batches:
         cls_batch_sampler = BalancedClassBatchSampler(cls_train.samples, args.cls_batch_size)
         cls_loader = DataLoader(
             cls_train,
             batch_sampler=cls_batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+    elif args.weighted_combined_sampling:
+        class_weights = build_sample_weights(
+            cls_train.samples,
+            class_only_weight=args.class_only_sample_weight,
+            mask_weight=args.mask_sample_weight,
+        )
+        cls_sampler = WeightedRandomSampler(
+            class_weights,
+            num_samples=len(cls_train),
+            replacement=True,
+        )
+        cls_loader = DataLoader(
+            cls_train,
+            batch_size=args.cls_batch_size,
+            sampler=cls_sampler,
             num_workers=args.num_workers,
             pin_memory=device.type == "cuda",
         )
@@ -603,17 +646,23 @@ def run_one_stage(args: argparse.Namespace) -> Path:
         )
         print(f"Quick validation samples: {len(quick_val_dataset)}")
 
-    model = build_multitask_model(
-        model_size=args.model_size,
-        base_channels=args.base_channels,
-        depths=args.depths,
-        mlp_ratio=args.mlp_ratio,
-        drop_path=args.drop_path,
-        decoder_channels=args.decoder_channels,
-        num_segmentation_classes=args.num_segmentation_classes,
-        decoder_type=args.decoder_type,
-        mask_guided_classifier=not args.no_mask_guided_classifier,
-    ).to(device)
+    if args.architecture == "resnet50":
+        model = build_resnet50_multitask_model(
+            num_segmentation_classes=args.num_segmentation_classes,
+            dropout=args.resnet_classifier_dropout,
+        ).to(device)
+    else:
+        model = build_multitask_model(
+            model_size=args.model_size,
+            base_channels=args.base_channels,
+            depths=args.depths,
+            mlp_ratio=args.mlp_ratio,
+            drop_path=args.drop_path,
+            decoder_channels=args.decoder_channels,
+            num_segmentation_classes=args.num_segmentation_classes,
+            decoder_type=args.decoder_type,
+            mask_guided_classifier=not args.no_mask_guided_classifier,
+        ).to(device)
     if args.resume_checkpoint is not None:
         load_model_weights(args.resume_checkpoint, model, device)
     if args.num_segmentation_classes == 1:

@@ -159,6 +159,38 @@ Recommended 1x V100 run:
 python -m src.training.train_multitask --data-root data/raw --epochs 40 --image-size 320 --model-size small --seg-batch-size 2 --cls-batch-size 16 --num-workers 4
 ```
 
+Experimental ResNet-50 supervised multi-task run:
+
+```powershell
+python -m src.training.train_multitask `
+  --data-root data/raw `
+  --architecture resnet50 `
+  --stage joint `
+  --epochs 100 `
+  --warmup-epochs 2 `
+  --image-size 384 `
+  --num-segmentation-classes 1 `
+  --seg-batch-size 2 `
+  --cls-batch-size 24 `
+  --val-batch-size 2 `
+  --num-workers 4 `
+  --learning-rate 1e-3 `
+  --min-learning-rate 1e-6 `
+  --weight-decay 5e-2 `
+  --label-smoothing 0.1 `
+  --segmentation-loss-weight 1.0 `
+  --dice-loss-weight 1.0 `
+  --seg-classification-loss-weight 1.0 `
+  --cls-loss-weight 1.0 `
+  --gradient-clip 5.0 `
+  --ema-decay 0.9998 `
+  --weighted-combined-sampling `
+  --class-only-sample-weight 1.0 `
+  --mask-sample-weight 2.5 `
+  --validation-threshold 0.50 `
+  --checkpoint-dir outputs/checkpoints/resnet50_multitask_384
+```
+
 If early full runs stay near random, try this lower-risk diagnostic training
 run before scaling back up:
 

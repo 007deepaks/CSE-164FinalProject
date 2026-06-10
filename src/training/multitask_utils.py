@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from starter.kaggle_metric import detailed_score, encode_mask_ids
 from src.metrics.classification_metrics import ClassificationMetricTracker
 from src.models.multitask_model import build_multitask_model
+from src.models.multitaskResnet50 import build_resnet50_multitask_model
 from src.training.classifier_utils import classifier_logits_with_tta
 from src.utils.masks import IGNORE_ID, NUM_CLASSES, decode_rgb_mask, encode_mask_to_rle, validate_prediction_mask
 
@@ -50,7 +51,14 @@ def load_multitask_checkpoint(
 ) -> tuple[nn.Module, dict[str, object], dict[str, object]]:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     saved_args = checkpoint.get("args", {})
-    model = build_multitask_model(**checkpoint_model_kwargs(saved_args)).to(device)
+    architecture = str(saved_args.get("architecture", "convnext"))
+    if architecture == "resnet50":
+        model = build_resnet50_multitask_model(
+            num_segmentation_classes=int(saved_args.get("num_segmentation_classes", 1)),
+            dropout=float(saved_args.get("resnet_classifier_dropout", 0.2)),
+        ).to(device)
+    else:
+        model = build_multitask_model(**checkpoint_model_kwargs(saved_args)).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     return model, checkpoint, saved_args
 
