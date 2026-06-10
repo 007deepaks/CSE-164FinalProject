@@ -100,7 +100,7 @@ def train_segmentation_batches(
         class_ids = batch["class_id"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=use_amp):
-            outputs = model(images)
+            outputs = model(images, seg=True)
             ce = segmentation_criterion(outputs["segmentation"], masks)
             class_loss = classification_criterion(outputs["classification"], class_ids)
         dice = binary_segmentation_dice_loss(outputs["segmentation"].float(), masks)
@@ -171,7 +171,7 @@ def train_classification_batches(
         class_ids = batch["class_id"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=use_amp):
-            outputs = model(images)
+            outputs = model(images, seg=False)
             raw_loss = classification_criterion(outputs["classification"], class_ids)
             loss = cls_loss_weight * raw_loss
         if not torch.isfinite(raw_loss.detach()).all() or not torch.isfinite(loss.detach()).all():
@@ -264,8 +264,8 @@ def train_joint_mixed_batches(
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=use_amp):
-            seg_outputs = model(seg_images)
-            cls_outputs = model(cls_images)
+            seg_outputs = model(seg_images, seg=True)
+            cls_outputs = model(cls_images, seg=False)
             ce = segmentation_criterion(seg_outputs["segmentation"], masks)
             seg_class_loss = classification_criterion(seg_outputs["classification"], seg_class_ids)
             cls_loss = classification_criterion(cls_outputs["classification"], cls_class_ids)
@@ -358,7 +358,7 @@ def compute_debug_train_metrics(
         masks = batch["mask"].to(device, non_blocking=True)
         semantic_masks = batch["semantic_mask"].to(device, non_blocking=True)
         class_ids = batch["class_id"].to(device, non_blocking=True)
-        outputs = model(images)
+        outputs = model(images, seg=True)
         binary_prediction = binary_prediction_from_logits(outputs["segmentation"], None)
         class_prediction = torch.argmax(outputs["classification"], dim=1)
         valid = masks != IGNORE_ID
@@ -388,7 +388,7 @@ def compute_debug_train_metrics(
     for batch in cls_loader:
         images = batch["image"].to(device, non_blocking=True)
         class_ids = batch["class_id"].to(device, non_blocking=True)
-        outputs = model(images)
+        outputs = model(images, seg=False)
         class_prediction = torch.argmax(outputs["classification"], dim=1)
         cls_correct += int((class_prediction == class_ids).sum().item())
         cls_total += int(class_ids.numel())
