@@ -482,7 +482,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validate-every", type=int, default=1)
     parser.add_argument("--full-val-every", type=int, default=1)
     parser.add_argument("--quick-val-samples", type=int)
-    parser.add_argument("--validation-thresholds", type=str, default="0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70")
+    parser.add_argument("--validation-threshold", type=float, default=0.50)
+    parser.add_argument(
+        "--validation-thresholds",
+        type=str,
+        default=None,
+        help="Deprecated during training; use post-training threshold sweep instead.",
+    )
     parser.add_argument(
         "--no-random-crop",
         action="store_true",
@@ -643,7 +649,8 @@ def run_one_stage(args: argparse.Namespace) -> Path:
     best_score = -1.0
     history: list[dict[str, float]] = []
     print(f"Training stage: {args.stage}")
-    validation_thresholds = parse_float_list(args.validation_thresholds)
+    if args.validation_thresholds is not None:
+        print("WARNING: --validation-thresholds is ignored during training; using --validation-threshold.")
 
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
@@ -724,21 +731,17 @@ def run_one_stage(args: argparse.Namespace) -> Path:
         if should_validate:
             validation_loader = val_loader if should_full_validate or quick_val_loader is None else quick_val_loader
             validation_kind = "full" if validation_loader is val_loader else "quick"
-            threshold_metrics = []
             validation_model = ema.module if ema is not None else model
-            for threshold in validation_thresholds:
-                metrics = validate_multitask(
-                    validation_model,
-                    validation_loader,
-                    args.data_root,
-                    device,
-                    segmentation_criterion,
-                    classification_criterion,
-                    seg_threshold=threshold,
-                )
-                metrics["seg_threshold"] = float(threshold)
-                threshold_metrics.append(metrics)
-            val_metrics = max(threshold_metrics, key=lambda item: item["automated_score"])
+            val_metrics = validate_multitask(
+                validation_model,
+                validation_loader,
+                args.data_root,
+                device,
+                segmentation_criterion,
+                classification_criterion,
+                seg_threshold=args.validation_threshold,
+            )
+            val_metrics["seg_threshold"] = float(args.validation_threshold)
         else:
             val_metrics = {
                 "automated_score": 0.0,
