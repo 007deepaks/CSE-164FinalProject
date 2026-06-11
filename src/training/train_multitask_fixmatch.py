@@ -241,6 +241,40 @@ def autocast_settings(use_amp: bool, precision: str) -> tuple[bool, torch.dtype 
     raise ValueError("precision must be 'fp16', 'bf16', or 'fp32'")
 
 
+def classifier_parameter_modules(model: nn.Module) -> list[nn.Module]:
+    modules: list[nn.Module] = []
+    for name in ["classifier", "class_norm", "class_head"]:
+        module = getattr(model, name, None)
+        if isinstance(module, nn.Module):
+            modules.append(module)
+    if not modules:
+        raise ValueError("Could not find classifier parameters on this multi-task model")
+    return modules
+
+
+def freeze_for_classifier_only(model: nn.Module) -> None:
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for module in classifier_parameter_modules(model):
+        for parameter in module.parameters():
+            parameter.requires_grad_(True)
+        module.train()
+    keep_frozen_modules_eval(model)
+
+
+def keep_frozen_modules_eval(model: nn.Module) -> None:
+    for name in ["encoder", "segmentation_head"]:
+        module = getattr(model, name, None)
+        if isinstance(module, nn.Module):
+            module.eval()
+
+
+def trainable_parameter_summary(model: nn.Module) -> tuple[int, int]:
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    total = sum(parameter.numel() for parameter in model.parameters())
+    return trainable, total
+
+
 def train_one_epoch(
     model: nn.Module,
     ema: ModelEma,
@@ -255,6 +289,8 @@ def train_one_epoch(
     da: DistributionAlignment | None,
 ) -> dict[str, float]:
     model.train()
+    if args.train_classifier_only:
+        keep_frozen_modules_eval(model)
     ema.module.eval()
     student_autocast_enabled, student_autocast_dtype = autocast_settings(use_amp, args.student_precision)
     supervised_iter = infinite_loader(supervised_loader)
@@ -319,7 +355,7 @@ def train_one_epoch(
         with autocast(device_type="cuda", enabled=student_autocast_enabled, dtype=student_autocast_dtype):
             supervised_outputs = model(images, seg=True)
             supervised_cls_loss = classification_criterion(supervised_outputs["classification"], class_ids)
-            if has_mask.any():
+            if has_mask.any() and not args.train_classifier_only:
                 seg_logits = supervised_outputs["segmentation"][has_mask]
                 seg_masks = masks[has_mask]
                 supervised_bce = binary_segmentation_bce_loss(seg_logits, seg_masks)
@@ -480,6 +516,11 @@ def parse_args() -> argparse.Namespace:
         default="bf16",
         help="Precision for student supervised/strong-view forwards. BF16 is recommended on A100/H100/Blackwell.",
     )
+    parser.add_argument(
+        "--train-classifier-only",
+        action="store_true",
+        help="Freeze encoder and segmentation head; update only classifier parameters.",
+    )
     parser.add_argument("--validation-threshold", type=float, default=0.55)
     parser.add_argument("--validate-every", type=int, default=1)
     parser.add_argument("--full-val-every", type=int, default=1)
@@ -572,7 +613,11 @@ def main() -> None:
     print(f"Using device: {device}; mixed precision: {use_amp}")
     print(f"Loading supervised checkpoint: {args.resume_checkpoint}")
     model, _, source_args = load_multitask_checkpoint(args.resume_checkpoint, device)
+    if args.train_classifier_only:
+        freeze_for_classifier_only(model)
     model.train()
+    if args.train_classifier_only:
+        keep_frozen_modules_eval(model)
     ema = ModelEma(model, args.ema_decay)
 
     supervised_dataset = SupervisedMultiTaskDataset(
@@ -652,12 +697,18 @@ def main() -> None:
     print(
         f"SSL: threshold={args.confidence_threshold}, unlabeled_weight={args.unlabeled_loss_weight}, "
         f"DA={args.distribution_alignment}, ssl_seg_forward={not args.ssl_fast_classifier}, "
-        f"teacher_precision={args.teacher_precision}, student_precision={args.student_precision}"
+        f"teacher_precision={args.teacher_precision}, student_precision={args.student_precision}, "
+        f"train_classifier_only={args.train_classifier_only}"
     )
 
     classification_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     validation_classification_criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable parameters found")
+    trainable_count, total_count = trainable_parameter_summary(model)
+    print(f"Trainable parameters: {trainable_count:,}/{total_count:,}")
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = build_warmup_cosine_scheduler(
         optimizer,
         epochs=args.epochs,
