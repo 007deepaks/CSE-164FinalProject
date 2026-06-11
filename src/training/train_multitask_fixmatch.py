@@ -178,6 +178,95 @@ def supervised_sample_weights(samples: list[SupervisedMultiTaskSample], class_we
     return [mask_weight if sample.mask_path is not None else class_weight for sample in samples]
 
 
+def smooth_one_hot(targets: torch.Tensor, num_classes: int, smoothing: float) -> torch.Tensor:
+    with torch.no_grad():
+        off_value = smoothing / num_classes
+        on_value = 1.0 - smoothing + off_value
+        smoothed = torch.full((targets.shape[0], num_classes), off_value, device=targets.device)
+        smoothed.scatter_(1, targets.unsqueeze(1), on_value)
+    return smoothed
+
+
+def soft_target_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return torch.sum(-targets * nn.functional.log_softmax(logits, dim=1), dim=1).mean()
+
+
+def rand_bbox(width: int, height: int, lam: float, center_x: int | None = None, center_y: int | None = None) -> tuple[int, int, int, int]:
+    cut_ratio = (1.0 - lam) ** 0.5
+    cut_width = max(1, int(width * cut_ratio))
+    cut_height = max(1, int(height * cut_ratio))
+    if center_x is None:
+        center_x = int(torch.randint(0, width, (1,)).item())
+    if center_y is None:
+        center_y = int(torch.randint(0, height, (1,)).item())
+    x1 = max(center_x - cut_width // 2, 0)
+    y1 = max(center_y - cut_height // 2, 0)
+    x2 = min(center_x + cut_width // 2, width)
+    y2 = min(center_y + cut_height // 2, height)
+    return x1, y1, x2, y2
+
+
+def foreground_center(mask: torch.Tensor) -> tuple[int | None, int | None]:
+    foreground = torch.nonzero(mask == 1, as_tuple=False)
+    if foreground.numel() == 0:
+        return None, None
+    index = int(torch.randint(0, foreground.shape[0], (1,), device=mask.device).item())
+    y = int(foreground[index, 0].item())
+    x = int(foreground[index, 1].item())
+    return x, y
+
+
+def maybe_apply_classifier_mixup_cutmix(
+    images: torch.Tensor,
+    class_ids: torch.Tensor,
+    masks: torch.Tensor,
+    has_mask: torch.Tensor,
+    label_smoothing: float,
+    mixup_alpha: float,
+    cutmix_alpha: float,
+    mix_prob: float,
+    foreground_cutmix: bool,
+) -> tuple[torch.Tensor, torch.Tensor, bool, str]:
+    target_probs = smooth_one_hot(class_ids, NUM_CLASSES, label_smoothing)
+    if mix_prob <= 0 or len(images) < 2 or torch.rand(1).item() > mix_prob:
+        return images, target_probs, False, "none"
+
+    use_cutmix = cutmix_alpha > 0 and (mixup_alpha <= 0 or torch.rand(1).item() < 0.5)
+    alpha = cutmix_alpha if use_cutmix else mixup_alpha
+    if alpha <= 0:
+        return images, target_probs, False, "none"
+
+    lam = float(torch.distributions.Beta(alpha, alpha).sample().item())
+    permutation = torch.randperm(images.shape[0], device=images.device)
+    if not use_cutmix:
+        mixed_images = lam * images + (1.0 - lam) * images[permutation]
+        mixed_targets = lam * target_probs + (1.0 - lam) * target_probs[permutation]
+        return mixed_images, mixed_targets, True, "mixup"
+
+    _, _, height, width = images.shape
+    mixed_images = images.clone()
+    mixed_targets = target_probs.clone()
+    image_area = float(height * width)
+    foreground_source_indices = torch.nonzero(has_mask, as_tuple=False).flatten() if foreground_cutmix else torch.empty(0, device=images.device, dtype=torch.long)
+    for row_index in range(images.shape[0]):
+        if foreground_source_indices.numel() > 0:
+            candidates = foreground_source_indices
+            if candidates.numel() > 1:
+                candidates = candidates[candidates != row_index]
+            source_index = int(candidates[torch.randint(0, candidates.numel(), (1,), device=images.device)].item())
+        else:
+            source_index = int(permutation[row_index].item())
+        center_x = None
+        center_y = None
+        if foreground_cutmix and bool(has_mask[source_index].item()):
+            center_x, center_y = foreground_center(masks[source_index])
+        x1, y1, x2, y2 = rand_bbox(width, height, lam, center_x=center_x, center_y=center_y)
+        mixed_images[row_index, :, y1:y2, x1:x2] = images[source_index, :, y1:y2, x1:x2]
+        box_fraction = ((x2 - x1) * (y2 - y1)) / image_area
+        mixed_targets[row_index] = (1.0 - box_fraction) * target_probs[row_index] + box_fraction * target_probs[source_index]
+    return mixed_images, mixed_targets, True, "foreground_cutmix" if foreground_cutmix else "cutmix"
+
+
 def save_checkpoint(
     path: Path,
     model: nn.Module,
@@ -312,6 +401,7 @@ def train_one_epoch(
         "adjusted_confidence_max": 0.0,
         "raw_accept": 0.0,
         "nonfinite_teacher_rows": 0.0,
+        "classifier_mix_steps": 0.0,
         "steps": 0.0,
     }
     class_hist = torch.zeros(NUM_CLASSES, dtype=torch.long)
@@ -354,7 +444,29 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=student_autocast_enabled, dtype=student_autocast_dtype):
             supervised_outputs = model(images, seg=True)
-            supervised_cls_loss = classification_criterion(supervised_outputs["classification"], class_ids)
+            mixed_images, mixed_targets, used_classifier_mix, classifier_mix_kind = maybe_apply_classifier_mixup_cutmix(
+                images,
+                class_ids,
+                masks,
+                has_mask,
+                label_smoothing=args.label_smoothing,
+                mixup_alpha=args.classifier_mixup_alpha,
+                cutmix_alpha=args.classifier_cutmix_alpha,
+                mix_prob=args.classifier_mix_prob,
+                foreground_cutmix=args.classifier_foreground_cutmix,
+            )
+            if used_classifier_mix:
+                mixed_logits = forward_classification_chunks(
+                    model,
+                    mixed_images,
+                    use_amp,
+                    args.strong_forward_batch_size,
+                    seg_forward=not args.ssl_fast_classifier,
+                    precision=args.student_precision,
+                )
+                supervised_cls_loss = soft_target_cross_entropy(mixed_logits, mixed_targets)
+            else:
+                supervised_cls_loss = classification_criterion(supervised_outputs["classification"], class_ids)
             if has_mask.any() and not args.train_classifier_only:
                 seg_logits = supervised_outputs["segmentation"][has_mask]
                 seg_masks = masks[has_mask]
@@ -422,6 +534,7 @@ def train_one_epoch(
             totals["adjusted_confidence_sum"] += float(confidence.sum().item())
             totals["raw_confidence_max"] = max(totals["raw_confidence_max"], float(raw_confidence.max().item()))
             totals["adjusted_confidence_max"] = max(totals["adjusted_confidence_max"], float(confidence.max().item()))
+            totals["classifier_mix_steps"] += 1.0 if used_classifier_mix else 0.0
             totals["supervised_cls_loss"] += float(supervised_cls_loss.item())
             totals["supervised_seg_loss"] += float(supervised_bce.item())
             totals["supervised_dice_loss"] += float(supervised_dice.item())
@@ -441,7 +554,8 @@ def train_one_epoch(
                 f"bad_teacher={totals['nonfinite_teacher_rows'] / max(1.0, totals['seen']):.3f} "
                 f"raw_conf={totals['raw_confidence_sum'] / max(1.0, totals['seen']):.3f}/{totals['raw_confidence_max']:.3f} "
                 f"adj_conf={totals['adjusted_confidence_sum'] / max(1.0, totals['seen']):.3f}/{totals['adjusted_confidence_max']:.3f} "
-                f"accepted_conf={totals['confidence_sum'] / accepted_total:.3f}"
+                f"accepted_conf={totals['confidence_sum'] / accepted_total:.3f} "
+                f"classifier_mix={classifier_mix_kind}"
             )
 
     divisor = max(1.0, totals["steps"])
@@ -463,6 +577,7 @@ def train_one_epoch(
         "pseudo_raw_max_confidence": totals["raw_confidence_max"],
         "pseudo_adjusted_max_confidence": totals["adjusted_confidence_max"],
         "pseudo_class_coverage": float(covered_classes),
+        "classifier_mix_rate": totals["classifier_mix_steps"] / divisor,
         "supervised_train_accuracy": supervised_correct / max(1, supervised_total),
         "pseudo_top_hist": top_hist,
     }
@@ -490,6 +605,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--segmentation-loss-weight", type=float, default=1.0)
     parser.add_argument("--dice-loss-weight", type=float, default=1.0)
     parser.add_argument("--unlabeled-loss-weight", type=float, default=1.0)
+    parser.add_argument("--classifier-mixup-alpha", type=float, default=0.0)
+    parser.add_argument("--classifier-cutmix-alpha", type=float, default=0.0)
+    parser.add_argument("--classifier-mix-prob", type=float, default=0.0)
+    parser.add_argument(
+        "--classifier-foreground-cutmix",
+        action="store_true",
+        help="Center classifier CutMix patches on source foreground mask pixels when masks are available.",
+    )
     parser.add_argument("--confidence-threshold", type=float, default=0.95)
     parser.add_argument("--ema-decay", type=float, default=0.9999)
     parser.add_argument("--gradient-clip", type=float, default=5.0)
@@ -698,7 +821,11 @@ def main() -> None:
         f"SSL: threshold={args.confidence_threshold}, unlabeled_weight={args.unlabeled_loss_weight}, "
         f"DA={args.distribution_alignment}, ssl_seg_forward={not args.ssl_fast_classifier}, "
         f"teacher_precision={args.teacher_precision}, student_precision={args.student_precision}, "
-        f"train_classifier_only={args.train_classifier_only}"
+        f"train_classifier_only={args.train_classifier_only}, "
+        f"classifier_mixup_alpha={args.classifier_mixup_alpha}, "
+        f"classifier_cutmix_alpha={args.classifier_cutmix_alpha}, "
+        f"classifier_mix_prob={args.classifier_mix_prob}, "
+        f"classifier_foreground_cutmix={args.classifier_foreground_cutmix}"
     )
 
     classification_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
@@ -785,6 +912,7 @@ def main() -> None:
             f"sup_cls={float(row['supervised_cls_loss']):.4f} "
             f"sup_seg={float(row['supervised_seg_loss']):.4f} "
             f"unsup={float(row['unsupervised_cls_loss']):.4f} "
+            f"mix_rate={float(row['classifier_mix_rate']):.3f} "
             f"accept={float(row['pseudo_acceptance_rate']):.3f} "
             f"conf={float(row['pseudo_mean_confidence']):.3f} "
             f"coverage={int(float(row['pseudo_class_coverage']))}/{NUM_CLASSES} "
