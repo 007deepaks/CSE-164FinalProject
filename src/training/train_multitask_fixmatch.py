@@ -238,6 +238,11 @@ def train_one_epoch(
         "accepted": 0.0,
         "seen": 0.0,
         "confidence_sum": 0.0,
+        "raw_confidence_sum": 0.0,
+        "adjusted_confidence_sum": 0.0,
+        "raw_confidence_max": 0.0,
+        "adjusted_confidence_max": 0.0,
+        "raw_accept": 0.0,
         "steps": 0.0,
     }
     class_hist = torch.zeros(NUM_CLASSES, dtype=torch.long)
@@ -263,11 +268,14 @@ def train_one_epoch(
                 args.weak_forward_batch_size,
                 seg_forward=not args.ssl_fast_classifier,
             ).float()
-            probs = torch.softmax(teacher_logits, dim=1)
+            raw_probs = torch.softmax(teacher_logits, dim=1)
+            raw_confidence, _ = raw_probs.max(dim=1)
+            probs = raw_probs
             if da is not None:
                 probs = da.adjust(probs)
             confidence, pseudo_targets = probs.max(dim=1)
             accepted_mask = confidence.ge(args.confidence_threshold)
+            raw_accept_mask = raw_confidence.ge(args.confidence_threshold)
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=use_amp):
@@ -333,6 +341,11 @@ def train_one_epoch(
                 totals["confidence_sum"] += float(confidence[accepted_mask].sum().item())
             totals["accepted"] += float(accepted_count)
             totals["seen"] += float(accepted_mask.numel())
+            totals["raw_accept"] += float(raw_accept_mask.sum().item())
+            totals["raw_confidence_sum"] += float(raw_confidence.sum().item())
+            totals["adjusted_confidence_sum"] += float(confidence.sum().item())
+            totals["raw_confidence_max"] = max(totals["raw_confidence_max"], float(raw_confidence.max().item()))
+            totals["adjusted_confidence_max"] = max(totals["adjusted_confidence_max"], float(confidence.max().item()))
             totals["supervised_cls_loss"] += float(supervised_cls_loss.item())
             totals["supervised_seg_loss"] += float(supervised_bce.item())
             totals["supervised_dice_loss"] += float(supervised_dice.item())
@@ -348,7 +361,10 @@ def train_one_epoch(
                 f"sup_seg={supervised_seg_loss.item():.4f} "
                 f"unsup={unsupervised_cls_loss.item():.4f} "
                 f"accept={totals['accepted'] / max(1.0, totals['seen']):.3f} "
-                f"conf={totals['confidence_sum'] / accepted_total:.3f}"
+                f"raw_accept={totals['raw_accept'] / max(1.0, totals['seen']):.3f} "
+                f"raw_conf={totals['raw_confidence_sum'] / max(1.0, totals['seen']):.3f}/{totals['raw_confidence_max']:.3f} "
+                f"adj_conf={totals['adjusted_confidence_sum'] / max(1.0, totals['seen']):.3f}/{totals['adjusted_confidence_max']:.3f} "
+                f"accepted_conf={totals['confidence_sum'] / accepted_total:.3f}"
             )
 
     divisor = max(1.0, totals["steps"])
@@ -362,7 +378,12 @@ def train_one_epoch(
         "unsupervised_cls_loss": totals["unsupervised_cls_loss"] / divisor,
         "total_loss": totals["total_loss"] / divisor,
         "pseudo_acceptance_rate": totals["accepted"] / max(1.0, totals["seen"]),
+        "pseudo_raw_acceptance_rate": totals["raw_accept"] / max(1.0, totals["seen"]),
         "pseudo_mean_confidence": totals["confidence_sum"] / max(1.0, totals["accepted"]),
+        "pseudo_raw_mean_confidence": totals["raw_confidence_sum"] / max(1.0, totals["seen"]),
+        "pseudo_adjusted_mean_confidence": totals["adjusted_confidence_sum"] / max(1.0, totals["seen"]),
+        "pseudo_raw_max_confidence": totals["raw_confidence_max"],
+        "pseudo_adjusted_max_confidence": totals["adjusted_confidence_max"],
         "pseudo_class_coverage": float(covered_classes),
         "supervised_train_accuracy": supervised_correct / max(1, supervised_total),
         "pseudo_top_hist": top_hist,
@@ -403,6 +424,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--steps-per-epoch", type=int)
     parser.add_argument("--print-every", type=int, default=50)
+    parser.add_argument("--diagnose-teacher-only", action="store_true")
+    parser.add_argument("--diagnose-batches", type=int, default=20)
     parser.add_argument("--validation-threshold", type=float, default=0.55)
     parser.add_argument("--validate-every", type=int, default=1)
     parser.add_argument("--full-val-every", type=int, default=1)
@@ -415,6 +438,62 @@ def parse_args() -> argparse.Namespace:
         help="Use seg=False for unlabeled weak/strong forwards. Faster, but not mask-guided.",
     )
     return parser.parse_args()
+
+
+@torch.no_grad()
+def diagnose_teacher_confidence(
+    teacher: nn.Module,
+    unlabeled_loader: DataLoader,
+    device: torch.device,
+    use_amp: bool,
+    args: argparse.Namespace,
+    da: DistributionAlignment | None,
+) -> None:
+    teacher.eval()
+    raw_confidences: list[torch.Tensor] = []
+    adjusted_confidences: list[torch.Tensor] = []
+    raw_classes = torch.zeros(NUM_CLASSES, dtype=torch.long)
+    adjusted_classes = torch.zeros(NUM_CLASSES, dtype=torch.long)
+    for batch_index, batch in enumerate(unlabeled_loader, start=1):
+        weak_images = batch["weak_image"].to(device, non_blocking=True)
+        logits = forward_classification_chunks(
+            teacher,
+            weak_images,
+            use_amp,
+            args.weak_forward_batch_size,
+            seg_forward=not args.ssl_fast_classifier,
+        ).float()
+        raw_probs = torch.softmax(logits, dim=1)
+        raw_conf, raw_target = raw_probs.max(dim=1)
+        adjusted_probs = da.adjust(raw_probs) if da is not None else raw_probs
+        adjusted_conf, adjusted_target = adjusted_probs.max(dim=1)
+        raw_confidences.append(raw_conf.cpu())
+        adjusted_confidences.append(adjusted_conf.cpu())
+        raw_classes += torch.bincount(raw_target.cpu(), minlength=NUM_CLASSES)
+        adjusted_classes += torch.bincount(adjusted_target.cpu(), minlength=NUM_CLASSES)
+        if batch_index >= args.diagnose_batches:
+            break
+
+    raw = torch.cat(raw_confidences)
+    adjusted = torch.cat(adjusted_confidences)
+    thresholds = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+    print("\nTeacher confidence diagnosis")
+    print(f"  samples={raw.numel()} DA={da is not None} ssl_seg_forward={not args.ssl_fast_classifier}")
+    for name, values, classes in [("raw", raw, raw_classes), ("adjusted", adjusted, adjusted_classes)]:
+        quantiles = torch.quantile(values, torch.tensor([0.50, 0.75, 0.90, 0.95, 0.99]))
+        accept_parts = [f"{threshold:.2f}:{float((values >= threshold).float().mean().item()):.3f}" for threshold in thresholds]
+        top_counts, top_classes = torch.topk(classes, k=10)
+        top_hist = ",".join(
+            f"{int(cls)}:{int(count)}" for cls, count in zip(top_classes, top_counts) if int(count) > 0
+        )
+        print(
+            f"  {name}: mean={float(values.mean()):.4f} max={float(values.max()):.4f} "
+            f"p50={float(quantiles[0]):.4f} p75={float(quantiles[1]):.4f} "
+            f"p90={float(quantiles[2]):.4f} p95={float(quantiles[3]):.4f} "
+            f"p99={float(quantiles[4]):.4f}"
+        )
+        print(f"  {name} acceptance: {' '.join(accept_parts)}")
+        print(f"  {name} top_classes: {top_hist}")
 
 
 def main() -> None:
@@ -522,6 +601,9 @@ def main() -> None:
             group["lr"] = first_epoch_lr
     scaler = GradScaler(enabled=use_amp)
     da = DistributionAlignment(NUM_CLASSES, args.distribution_alignment_momentum) if args.distribution_alignment else None
+    if args.diagnose_teacher_only:
+        diagnose_teacher_confidence(ema.module, unlabeled_loader, device, use_amp, args, da)
+        return
     best_score = -1.0
     history: list[dict[str, object]] = []
 
