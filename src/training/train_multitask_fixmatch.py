@@ -150,12 +150,21 @@ class DistributionAlignment:
         self.p_model: torch.Tensor | None = None
 
     @torch.no_grad()
-    def adjust(self, probs: torch.Tensor) -> torch.Tensor:
-        batch_mean = probs.detach().mean(dim=0)
+    def adjust(self, probs: torch.Tensor, valid_rows: torch.Tensor | None = None) -> torch.Tensor:
+        if valid_rows is None:
+            valid_rows = torch.isfinite(probs).all(dim=1)
         if self.p_model is None:
-            self.p_model = torch.full_like(batch_mean, 1.0 / self.num_classes)
-        self.p_model.mul_(self.momentum).add_(batch_mean, alpha=1.0 - self.momentum)
-        adjusted = probs * ((1.0 / self.num_classes) / (self.p_model.to(probs.device) + 1e-6))
+            self.p_model = torch.full((self.num_classes,), 1.0 / self.num_classes, device=probs.device, dtype=probs.dtype)
+        if valid_rows.any():
+            batch_mean = probs.detach()[valid_rows].mean(dim=0)
+            batch_mean = torch.nan_to_num(batch_mean, nan=1.0 / self.num_classes, posinf=1.0, neginf=0.0)
+            batch_mean = batch_mean / batch_mean.sum().clamp_min(1e-6)
+            self.p_model = self.p_model.to(probs.device)
+            self.p_model.mul_(self.momentum).add_(batch_mean, alpha=1.0 - self.momentum)
+            self.p_model = torch.nan_to_num(self.p_model, nan=1.0 / self.num_classes, posinf=1.0, neginf=0.0)
+            self.p_model = self.p_model / self.p_model.sum().clamp_min(1e-6)
+        safe_probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        adjusted = safe_probs * ((1.0 / self.num_classes) / (self.p_model.to(probs.device) + 1e-6))
         return adjusted / adjusted.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
 
@@ -243,6 +252,7 @@ def train_one_epoch(
         "raw_confidence_max": 0.0,
         "adjusted_confidence_max": 0.0,
         "raw_accept": 0.0,
+        "nonfinite_teacher_rows": 0.0,
         "steps": 0.0,
     }
     class_hist = torch.zeros(NUM_CLASSES, dtype=torch.long)
@@ -268,14 +278,18 @@ def train_one_epoch(
                 args.weak_forward_batch_size,
                 seg_forward=not args.ssl_fast_classifier,
             ).float()
-            raw_probs = torch.softmax(teacher_logits, dim=1)
+            finite_teacher_rows = torch.isfinite(teacher_logits).all(dim=1)
+            safe_teacher_logits = torch.nan_to_num(teacher_logits, nan=0.0, posinf=0.0, neginf=0.0)
+            raw_probs = torch.softmax(safe_teacher_logits, dim=1)
             raw_confidence, _ = raw_probs.max(dim=1)
             probs = raw_probs
             if da is not None:
-                probs = da.adjust(probs)
+                probs = da.adjust(probs, finite_teacher_rows)
             confidence, pseudo_targets = probs.max(dim=1)
-            accepted_mask = confidence.ge(args.confidence_threshold)
-            raw_accept_mask = raw_confidence.ge(args.confidence_threshold)
+            raw_confidence = torch.where(finite_teacher_rows, raw_confidence, torch.zeros_like(raw_confidence))
+            confidence = torch.where(finite_teacher_rows, confidence, torch.zeros_like(confidence))
+            accepted_mask = finite_teacher_rows & confidence.ge(args.confidence_threshold)
+            raw_accept_mask = finite_teacher_rows & raw_confidence.ge(args.confidence_threshold)
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=use_amp):
@@ -342,6 +356,7 @@ def train_one_epoch(
             totals["accepted"] += float(accepted_count)
             totals["seen"] += float(accepted_mask.numel())
             totals["raw_accept"] += float(raw_accept_mask.sum().item())
+            totals["nonfinite_teacher_rows"] += float((~finite_teacher_rows).sum().item())
             totals["raw_confidence_sum"] += float(raw_confidence.sum().item())
             totals["adjusted_confidence_sum"] += float(confidence.sum().item())
             totals["raw_confidence_max"] = max(totals["raw_confidence_max"], float(raw_confidence.max().item()))
@@ -362,6 +377,7 @@ def train_one_epoch(
                 f"unsup={unsupervised_cls_loss.item():.4f} "
                 f"accept={totals['accepted'] / max(1.0, totals['seen']):.3f} "
                 f"raw_accept={totals['raw_accept'] / max(1.0, totals['seen']):.3f} "
+                f"bad_teacher={totals['nonfinite_teacher_rows'] / max(1.0, totals['seen']):.3f} "
                 f"raw_conf={totals['raw_confidence_sum'] / max(1.0, totals['seen']):.3f}/{totals['raw_confidence_max']:.3f} "
                 f"adj_conf={totals['adjusted_confidence_sum'] / max(1.0, totals['seen']):.3f}/{totals['adjusted_confidence_max']:.3f} "
                 f"accepted_conf={totals['confidence_sum'] / accepted_total:.3f}"
@@ -379,6 +395,7 @@ def train_one_epoch(
         "total_loss": totals["total_loss"] / divisor,
         "pseudo_acceptance_rate": totals["accepted"] / max(1.0, totals["seen"]),
         "pseudo_raw_acceptance_rate": totals["raw_accept"] / max(1.0, totals["seen"]),
+        "pseudo_nonfinite_teacher_rate": totals["nonfinite_teacher_rows"] / max(1.0, totals["seen"]),
         "pseudo_mean_confidence": totals["confidence_sum"] / max(1.0, totals["accepted"]),
         "pseudo_raw_mean_confidence": totals["raw_confidence_sum"] / max(1.0, totals["seen"]),
         "pseudo_adjusted_mean_confidence": totals["adjusted_confidence_sum"] / max(1.0, totals["seen"]),
@@ -454,6 +471,8 @@ def diagnose_teacher_confidence(
     adjusted_confidences: list[torch.Tensor] = []
     raw_classes = torch.zeros(NUM_CLASSES, dtype=torch.long)
     adjusted_classes = torch.zeros(NUM_CLASSES, dtype=torch.long)
+    nonfinite_rows = 0
+    total_rows = 0
     for batch_index, batch in enumerate(unlabeled_loader, start=1):
         weak_images = batch["weak_image"].to(device, non_blocking=True)
         logits = forward_classification_chunks(
@@ -463,23 +482,35 @@ def diagnose_teacher_confidence(
             args.weak_forward_batch_size,
             seg_forward=not args.ssl_fast_classifier,
         ).float()
-        raw_probs = torch.softmax(logits, dim=1)
+        finite_rows = torch.isfinite(logits).all(dim=1)
+        safe_logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+        raw_probs = torch.softmax(safe_logits, dim=1)
         raw_conf, raw_target = raw_probs.max(dim=1)
-        adjusted_probs = da.adjust(raw_probs) if da is not None else raw_probs
+        adjusted_probs = da.adjust(raw_probs, finite_rows) if da is not None else raw_probs
         adjusted_conf, adjusted_target = adjusted_probs.max(dim=1)
-        raw_confidences.append(raw_conf.cpu())
-        adjusted_confidences.append(adjusted_conf.cpu())
-        raw_classes += torch.bincount(raw_target.cpu(), minlength=NUM_CLASSES)
-        adjusted_classes += torch.bincount(adjusted_target.cpu(), minlength=NUM_CLASSES)
+        if finite_rows.any():
+            raw_confidences.append(raw_conf[finite_rows].cpu())
+            adjusted_confidences.append(adjusted_conf[finite_rows].cpu())
+            raw_classes += torch.bincount(raw_target[finite_rows].cpu(), minlength=NUM_CLASSES)
+            adjusted_classes += torch.bincount(adjusted_target[finite_rows].cpu(), minlength=NUM_CLASSES)
+        nonfinite_rows += int((~finite_rows).sum().item())
+        total_rows += int(finite_rows.numel())
         if batch_index >= args.diagnose_batches:
             break
 
-    raw = torch.cat(raw_confidences)
-    adjusted = torch.cat(adjusted_confidences)
+    raw = torch.cat(raw_confidences) if raw_confidences else torch.empty(0)
+    adjusted = torch.cat(adjusted_confidences) if adjusted_confidences else torch.empty(0)
     thresholds = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
     print("\nTeacher confidence diagnosis")
-    print(f"  samples={raw.numel()} DA={da is not None} ssl_seg_forward={not args.ssl_fast_classifier}")
+    print(
+        f"  samples={total_rows} finite={raw.numel()} "
+        f"nonfinite={nonfinite_rows} nonfinite_rate={nonfinite_rows / max(1, total_rows):.3f} "
+        f"DA={da is not None} ssl_seg_forward={not args.ssl_fast_classifier}"
+    )
     for name, values, classes in [("raw", raw, raw_classes), ("adjusted", adjusted, adjusted_classes)]:
+        if values.numel() == 0:
+            print(f"  {name}: no finite teacher outputs")
+            continue
         quantiles = torch.quantile(values, torch.tensor([0.50, 0.75, 0.90, 0.95, 0.99]))
         accept_parts = [f"{threshold:.2f}:{float((values >= threshold).float().mean().item()):.3f}" for threshold in thresholds]
         top_counts, top_classes = torch.topk(classes, k=10)
