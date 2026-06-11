@@ -210,7 +210,7 @@ def forward_classification_chunks(
     use_amp: bool,
     chunk_size: int | None,
     seg_forward: bool,
-    precision: str = "amp",
+    precision: str = "fp16",
 ) -> torch.Tensor:
     chunks = images.split(chunk_size or len(images))
     logits: list[torch.Tensor] = []
@@ -218,17 +218,27 @@ def forward_classification_chunks(
         if precision == "fp32":
             autocast_enabled = False
             autocast_dtype = None
+        elif precision == "fp16":
+            autocast_enabled = use_amp
+            autocast_dtype = torch.float16
         elif precision == "bf16":
             autocast_enabled = use_amp
             autocast_dtype = torch.bfloat16
-        elif precision == "amp":
-            autocast_enabled = use_amp
-            autocast_dtype = None
         else:
-            raise ValueError("precision must be 'amp', 'fp32', or 'bf16'")
+            raise ValueError("precision must be 'fp16', 'bf16', or 'fp32'")
         with autocast(device_type="cuda", enabled=autocast_enabled, dtype=autocast_dtype):
             logits.append(model(chunk, seg=seg_forward)["classification"])
     return torch.cat(logits, dim=0)
+
+
+def autocast_settings(use_amp: bool, precision: str) -> tuple[bool, torch.dtype | None]:
+    if precision == "fp32" or not use_amp:
+        return False, None
+    if precision == "bf16":
+        return True, torch.bfloat16
+    if precision == "fp16":
+        return True, torch.float16
+    raise ValueError("precision must be 'fp16', 'bf16', or 'fp32'")
 
 
 def train_one_epoch(
@@ -246,6 +256,7 @@ def train_one_epoch(
 ) -> dict[str, float]:
     model.train()
     ema.module.eval()
+    student_autocast_enabled, student_autocast_dtype = autocast_settings(use_amp, args.student_precision)
     supervised_iter = infinite_loader(supervised_loader)
     unlabeled_iter = infinite_loader(unlabeled_loader)
     steps = args.steps_per_epoch or max(len(supervised_loader), int(len(unlabeled_loader) / max(1.0, args.unlabeled_ratio)))
@@ -305,7 +316,7 @@ def train_one_epoch(
             raw_accept_mask = finite_teacher_rows & raw_confidence.ge(args.confidence_threshold)
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast(device_type="cuda", enabled=use_amp):
+        with autocast(device_type="cuda", enabled=student_autocast_enabled, dtype=student_autocast_dtype):
             supervised_outputs = model(images, seg=True)
             supervised_cls_loss = classification_criterion(supervised_outputs["classification"], class_ids)
             if has_mask.any():
@@ -326,6 +337,7 @@ def train_one_epoch(
                     use_amp,
                     args.strong_forward_batch_size,
                     seg_forward=not args.ssl_fast_classifier,
+                    precision=args.student_precision,
                 )
                 unsupervised_cls_loss = nn.functional.cross_entropy(strong_logits, pseudo_targets[accepted_mask])
             else:
@@ -461,6 +473,12 @@ def parse_args() -> argparse.Namespace:
         choices=["fp32", "bf16"],
         default="fp32",
         help="Precision for EMA teacher weak-view pseudo-label forwards.",
+    )
+    parser.add_argument(
+        "--student-precision",
+        choices=["bf16", "fp16", "fp32"],
+        default="bf16",
+        help="Precision for student supervised/strong-view forwards. BF16 is recommended on A100/H100/Blackwell.",
     )
     parser.add_argument("--validation-threshold", type=float, default=0.55)
     parser.add_argument("--validate-every", type=int, default=1)
@@ -634,7 +652,7 @@ def main() -> None:
     print(
         f"SSL: threshold={args.confidence_threshold}, unlabeled_weight={args.unlabeled_loss_weight}, "
         f"DA={args.distribution_alignment}, ssl_seg_forward={not args.ssl_fast_classifier}, "
-        f"teacher_precision={args.teacher_precision}"
+        f"teacher_precision={args.teacher_precision}, student_precision={args.student_precision}"
     )
 
     classification_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
@@ -651,7 +669,7 @@ def main() -> None:
         first_epoch_lr = args.learning_rate / max(1, min(args.warmup_epochs, max(1, args.epochs - 1)))
         for group in optimizer.param_groups:
             group["lr"] = first_epoch_lr
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler(enabled=use_amp and args.student_precision == "fp16")
     da = DistributionAlignment(NUM_CLASSES, args.distribution_alignment_momentum) if args.distribution_alignment else None
     if args.diagnose_teacher_only:
         diagnose_teacher_confidence(ema.module, unlabeled_loader, device, use_amp, args, da)
