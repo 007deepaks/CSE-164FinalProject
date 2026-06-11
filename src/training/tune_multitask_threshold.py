@@ -32,7 +32,7 @@ def score_thresholds(
     seg_checkpoint: Path,
     classifier_checkpoints: list[Path] | None,
     data_root: Path,
-    image_size: int,
+    image_size: int | None,
     batch_size: int,
     num_workers: int,
     max_val_samples: int | None,
@@ -40,13 +40,14 @@ def score_thresholds(
     tta: str,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    seg_model, _, _ = load_multitask_checkpoint(seg_checkpoint, device)
+    seg_model, _, saved_args = load_multitask_checkpoint(seg_checkpoint, device)
     seg_model.eval()
     classifier_models = load_classifier_checkpoints(classifier_checkpoints, device)
+    resolved_image_size = image_size or int(saved_args.get("image_size", 320))
     dataset = SegmentationDataset(
         data_root,
         split="val",
-        image_size=image_size,
+        image_size=resolved_image_size,
         target_mode="binary",
         max_samples=max_val_samples,
         augment=False,
@@ -128,7 +129,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seg-checkpoint", type=Path, required=True)
     parser.add_argument("--classifier-checkpoint", type=Path, nargs="+")
     parser.add_argument("--data-root", type=Path, default=Path("data/raw"))
-    parser.add_argument("--image-size", type=int, default=320)
+    parser.add_argument("--image-size", type=int)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-val-samples", type=int)

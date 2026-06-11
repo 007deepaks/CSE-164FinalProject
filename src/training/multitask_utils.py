@@ -52,10 +52,11 @@ def load_multitask_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     saved_args = checkpoint.get("args", {})
     architecture = str(saved_args.get("architecture", "convnext"))
-    if architecture == "resnet50":
+    if architecture in {"resnet50", "resnext50_32x4d"}:
         model = build_resnet50_multitask_model(
             num_segmentation_classes=int(saved_args.get("num_segmentation_classes", 1)),
             dropout=float(saved_args.get("resnet_classifier_dropout", 0.2)),
+            architecture=architecture,
         ).to(device)
     else:
         model = build_multitask_model(**checkpoint_model_kwargs(saved_args)).to(device)
