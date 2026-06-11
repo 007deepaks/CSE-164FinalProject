@@ -466,7 +466,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--stage", choices=["classifier_warmup", "joint", "warmup_joint"], default="joint")
     parser.add_argument("--resume-checkpoint", type=Path)
-    parser.add_argument("--architecture", choices=["convnext", "resnet50"], default="convnext")
+    parser.add_argument("--architecture", choices=["convnext", "resnet50", "resnext50_32x4d"], default="convnext")
     parser.add_argument("--background-weight", type=float, default=0.05)
     parser.add_argument("--foreground-weight", type=float, default=1.0)
     parser.add_argument("--segmentation-loss-weight", type=float, default=1.0)
@@ -540,9 +540,16 @@ def run_one_stage(args: argparse.Namespace) -> Path:
             f"base_channels={resolved['base_channels']}, depths={resolved['depths']}, "
             f"decoder_channels={resolved['decoder_channels']}"
         )
-    else:
+    elif args.architecture == "resnet50":
         print(
             "Multi-task ResNet-50 from scratch: "
+            f"image_size={args.image_size}, decoder=unet, "
+            f"num_segmentation_classes={args.num_segmentation_classes}, "
+            f"classifier_dropout={args.resnet_classifier_dropout}"
+        )
+    else:
+        print(
+            "Multi-task ResNeXt-50 32x4d from scratch: "
             f"image_size={args.image_size}, decoder=unet, "
             f"num_segmentation_classes={args.num_segmentation_classes}, "
             f"classifier_dropout={args.resnet_classifier_dropout}"
@@ -646,10 +653,11 @@ def run_one_stage(args: argparse.Namespace) -> Path:
         )
         print(f"Quick validation samples: {len(quick_val_dataset)}")
 
-    if args.architecture == "resnet50":
+    if args.architecture in {"resnet50", "resnext50_32x4d"}:
         model = build_resnet50_multitask_model(
             num_segmentation_classes=args.num_segmentation_classes,
             dropout=args.resnet_classifier_dropout,
+            architecture=args.architecture,
         ).to(device)
     else:
         model = build_multitask_model(

@@ -1,4 +1,4 @@
-"""ResNet-50 multi-task model trained from scratch."""
+"""ResNet/ResNeXt multi-task models trained from scratch."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from torch.nn import functional as F
 
 
 class Bottleneck(nn.Module):
-    """Standard ResNet bottleneck block."""
+    """ResNet-family bottleneck block with optional grouped 3x3 convolution."""
 
     expansion = 4
 
@@ -18,21 +18,25 @@ class Bottleneck(nn.Module):
         channels: int,
         stride: int = 1,
         downsample: nn.Module | None = None,
+        groups: int = 1,
+        base_width: int = 64,
     ) -> None:
         super().__init__()
         out_channels = channels * self.expansion
-        self.conv1 = nn.Conv2d(in_channels, channels, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
+        width = int(channels * (base_width / 64.0)) * groups
+        self.conv1 = nn.Conv2d(in_channels, width, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(width)
         self.conv2 = nn.Conv2d(
-            channels,
-            channels,
+            width,
+            width,
             kernel_size=3,
             stride=stride,
             padding=1,
+            groups=groups,
             bias=False,
         )
-        self.bn2 = nn.BatchNorm2d(channels)
-        self.conv3 = nn.Conv2d(channels, out_channels, kernel_size=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(width)
+        self.conv3 = nn.Conv2d(width, out_channels, kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
@@ -52,11 +56,13 @@ class Bottleneck(nn.Module):
 
 
 class ResNet50Encoder(nn.Module):
-    """ResNet-50 encoder returning C1-C4 feature maps."""
+    """ResNet-50/ResNeXt-50 encoder returning C1-C4 feature maps."""
 
-    def __init__(self, in_channels: int = 3) -> None:
+    def __init__(self, in_channels: int = 3, groups: int = 1, base_width: int = 64) -> None:
         super().__init__()
         self.inplanes = 64
+        self.groups = groups
+        self.base_width = base_width
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(64),
@@ -79,10 +85,19 @@ class ResNet50Encoder(nn.Module):
                 nn.BatchNorm2d(out_channels),
             )
 
-        layers: list[nn.Module] = [Bottleneck(self.inplanes, channels, stride=stride, downsample=downsample)]
+        layers: list[nn.Module] = [
+            Bottleneck(
+                self.inplanes,
+                channels,
+                stride=stride,
+                downsample=downsample,
+                groups=self.groups,
+                base_width=self.base_width,
+            )
+        ]
         self.inplanes = out_channels
         for _ in range(1, blocks):
-            layers.append(Bottleneck(self.inplanes, channels))
+            layers.append(Bottleneck(self.inplanes, channels, groups=self.groups, base_width=self.base_width))
         return nn.Sequential(*layers)
 
     def _init_weights(self) -> None:
@@ -145,16 +160,18 @@ class ResNetUNetDecoder(nn.Module):
 
 
 class ResNet50MultiTaskModel(nn.Module):
-    """Shared ResNet-50 encoder with binary segmentation and mask-guided classification."""
+    """Shared ResNet-family encoder with binary segmentation and mask-guided classification."""
 
     def __init__(
         self,
         num_classes: int = 300,
         num_segmentation_classes: int = 1,
         dropout: float = 0.2,
+        groups: int = 1,
+        base_width: int = 64,
     ) -> None:
         super().__init__()
-        self.encoder = ResNet50Encoder()
+        self.encoder = ResNet50Encoder(groups=groups, base_width=base_width)
         self.segmentation_head = ResNetUNetDecoder(
             self.encoder.channels,
             num_segmentation_classes=num_segmentation_classes,
@@ -203,9 +220,20 @@ def build_resnet50_multitask_model(
     num_classes: int = 300,
     num_segmentation_classes: int = 1,
     dropout: float = 0.2,
+    architecture: str = "resnet50",
 ) -> ResNet50MultiTaskModel:
+    if architecture == "resnet50":
+        groups = 1
+        base_width = 64
+    elif architecture == "resnext50_32x4d":
+        groups = 32
+        base_width = 4
+    else:
+        raise ValueError("architecture must be 'resnet50' or 'resnext50_32x4d'")
     return ResNet50MultiTaskModel(
         num_classes=num_classes,
         num_segmentation_classes=num_segmentation_classes,
         dropout=dropout,
+        groups=groups,
+        base_width=base_width,
     )
