@@ -210,11 +210,23 @@ def forward_classification_chunks(
     use_amp: bool,
     chunk_size: int | None,
     seg_forward: bool,
+    precision: str = "amp",
 ) -> torch.Tensor:
     chunks = images.split(chunk_size or len(images))
     logits: list[torch.Tensor] = []
     for chunk in chunks:
-        with autocast(device_type="cuda", enabled=use_amp):
+        if precision == "fp32":
+            autocast_enabled = False
+            autocast_dtype = None
+        elif precision == "bf16":
+            autocast_enabled = use_amp
+            autocast_dtype = torch.bfloat16
+        elif precision == "amp":
+            autocast_enabled = use_amp
+            autocast_dtype = None
+        else:
+            raise ValueError("precision must be 'amp', 'fp32', or 'bf16'")
+        with autocast(device_type="cuda", enabled=autocast_enabled, dtype=autocast_dtype):
             logits.append(model(chunk, seg=seg_forward)["classification"])
     return torch.cat(logits, dim=0)
 
@@ -277,6 +289,7 @@ def train_one_epoch(
                 use_amp,
                 args.weak_forward_batch_size,
                 seg_forward=not args.ssl_fast_classifier,
+                precision=args.teacher_precision,
             ).float()
             finite_teacher_rows = torch.isfinite(teacher_logits).all(dim=1)
             safe_teacher_logits = torch.nan_to_num(teacher_logits, nan=0.0, posinf=0.0, neginf=0.0)
@@ -443,6 +456,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print-every", type=int, default=50)
     parser.add_argument("--diagnose-teacher-only", action="store_true")
     parser.add_argument("--diagnose-batches", type=int, default=20)
+    parser.add_argument(
+        "--teacher-precision",
+        choices=["fp32", "bf16"],
+        default="fp32",
+        help="Precision for EMA teacher weak-view pseudo-label forwards.",
+    )
     parser.add_argument("--validation-threshold", type=float, default=0.55)
     parser.add_argument("--validate-every", type=int, default=1)
     parser.add_argument("--full-val-every", type=int, default=1)
@@ -481,6 +500,7 @@ def diagnose_teacher_confidence(
             use_amp,
             args.weak_forward_batch_size,
             seg_forward=not args.ssl_fast_classifier,
+            precision=args.teacher_precision,
         ).float()
         finite_rows = torch.isfinite(logits).all(dim=1)
         safe_logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
@@ -613,7 +633,8 @@ def main() -> None:
     )
     print(
         f"SSL: threshold={args.confidence_threshold}, unlabeled_weight={args.unlabeled_loss_weight}, "
-        f"DA={args.distribution_alignment}, ssl_seg_forward={not args.ssl_fast_classifier}"
+        f"DA={args.distribution_alignment}, ssl_seg_forward={not args.ssl_fast_classifier}, "
+        f"teacher_precision={args.teacher_precision}"
     )
 
     classification_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
