@@ -12,7 +12,11 @@ from torch.utils.data import DataLoader
 
 from src.data.segmentation_dataset import SegmentationDataset, TestImageDataset
 from src.training.classifier_utils import classifier_logits_with_tta, load_classifier_checkpoints
-from src.training.multitask_utils import load_multitask_checkpoint, semantic_mask_from_binary_and_class_logits
+from src.training.multitask_utils import (
+    blend_classification_logits,
+    load_multitask_checkpoint,
+    semantic_mask_from_binary_and_class_logits,
+)
 from src.utils.masks import IGNORE_ID, decode_rgb_mask
 
 
@@ -77,6 +81,7 @@ def visualize(
     num_samples: int,
     output_dir: Path,
     classifier_checkpoints: list[Path] | None,
+    classifier_blend_weight: float,
     tta: str,
     seg_threshold: float | None,
 ) -> None:
@@ -103,14 +108,11 @@ def visualize(
         images = batch["image"].to(device)
         outputs = model(images)
         classification_logits = outputs["classification"]
-        if classifier_models:
-            classification_logits = classifier_logits_with_tta(classifier_models, images, tta)
         if tta in {"hflip", "multi_crop"}:
             flipped_images = torch.flip(images, dims=(-1,))
             flipped_outputs = model(flipped_images)
             flipped_classification_logits = flipped_outputs["classification"]
-            if not classifier_models:
-                classification_logits = 0.5 * (classification_logits + flipped_classification_logits)
+            classification_logits = 0.5 * (classification_logits + flipped_classification_logits)
             outputs = {
                 "segmentation": 0.5
                 * (outputs["segmentation"] + torch.flip(flipped_outputs["segmentation"], dims=(-1,))),
@@ -118,6 +120,13 @@ def visualize(
             }
         else:
             outputs["classification"] = classification_logits
+        if classifier_models:
+            external_classification_logits = classifier_logits_with_tta(classifier_models, images, tta)
+            outputs["classification"] = blend_classification_logits(
+                outputs["classification"],
+                external_classification_logits,
+                classifier_blend_weight,
+            )
         height = int(batch["original_height"][0])
         width = int(batch["original_width"][0])
         image_name = str(batch["image_name"][0])
@@ -148,6 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=12)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/figures"))
     parser.add_argument("--classifier-checkpoint", type=Path, nargs="+")
+    parser.add_argument("--classifier-blend-weight", type=float, default=1.0)
     parser.add_argument("--tta", choices=["none", "hflip", "multi_crop"], default="none")
     parser.add_argument("--seg-threshold", type=float)
     return parser.parse_args()
@@ -163,6 +173,7 @@ def main() -> None:
         num_samples=args.num_samples,
         output_dir=args.output_dir,
         classifier_checkpoints=args.classifier_checkpoint,
+        classifier_blend_weight=args.classifier_blend_weight,
         tta=args.tta,
         seg_threshold=args.seg_threshold,
     )
