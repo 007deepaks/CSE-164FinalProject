@@ -22,10 +22,12 @@ from src.data.segmentation_dataset import (
     image_to_tensor,
     semantic_to_binary_mask,
 )
+from src.training.classifier_utils import classifier_logits_with_tta, load_classifier_checkpoints
 from src.training.multitask_utils import (
     args_to_dict,
     binary_segmentation_bce_loss,
     binary_segmentation_dice_loss,
+    blend_classification_logits,
     load_multitask_checkpoint,
     validate_multitask,
 )
@@ -367,6 +369,7 @@ def trainable_parameter_summary(model: nn.Module) -> tuple[int, int]:
 def train_one_epoch(
     model: nn.Module,
     ema: ModelEma,
+    teacher_classifier_models: list[nn.Module],
     supervised_loader: DataLoader,
     unlabeled_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
@@ -428,6 +431,17 @@ def train_one_epoch(
                 seg_forward=not args.ssl_fast_classifier,
                 precision=args.teacher_precision,
             ).float()
+            if teacher_classifier_models:
+                external_teacher_logits = classifier_logits_with_tta(
+                    teacher_classifier_models,
+                    weak_images,
+                    args.teacher_classifier_tta,
+                ).float()
+                teacher_logits = blend_classification_logits(
+                    teacher_logits,
+                    external_teacher_logits,
+                    args.teacher_classifier_blend_weight,
+                )
             finite_teacher_rows = torch.isfinite(teacher_logits).all(dim=1)
             safe_teacher_logits = torch.nan_to_num(teacher_logits, nan=0.0, posinf=0.0, neginf=0.0)
             raw_probs = torch.softmax(safe_teacher_logits, dim=1)
@@ -625,6 +639,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--steps-per-epoch", type=int)
     parser.add_argument("--print-every", type=int, default=50)
+    parser.add_argument("--teacher-classifier-checkpoint", type=Path, nargs="+")
+    parser.add_argument("--teacher-classifier-blend-weight", type=float, default=0.0)
+    parser.add_argument("--teacher-classifier-tta", choices=["none", "hflip", "multi_crop"], default="none")
     parser.add_argument("--diagnose-teacher-only", action="store_true")
     parser.add_argument("--diagnose-batches", type=int, default=20)
     parser.add_argument(
@@ -661,6 +678,7 @@ def parse_args() -> argparse.Namespace:
 @torch.no_grad()
 def diagnose_teacher_confidence(
     teacher: nn.Module,
+    teacher_classifier_models: list[nn.Module],
     unlabeled_loader: DataLoader,
     device: torch.device,
     use_amp: bool,
@@ -684,6 +702,13 @@ def diagnose_teacher_confidence(
             seg_forward=not args.ssl_fast_classifier,
             precision=args.teacher_precision,
         ).float()
+        if teacher_classifier_models:
+            external_logits = classifier_logits_with_tta(
+                teacher_classifier_models,
+                weak_images,
+                args.teacher_classifier_tta,
+            ).float()
+            logits = blend_classification_logits(logits, external_logits, args.teacher_classifier_blend_weight)
         finite_rows = torch.isfinite(logits).all(dim=1)
         safe_logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
         raw_probs = torch.softmax(safe_logits, dim=1)
@@ -736,6 +761,7 @@ def main() -> None:
     print(f"Using device: {device}; mixed precision: {use_amp}")
     print(f"Loading supervised checkpoint: {args.resume_checkpoint}")
     model, _, source_args = load_multitask_checkpoint(args.resume_checkpoint, device)
+    teacher_classifier_models = load_classifier_checkpoints(args.teacher_classifier_checkpoint, device)
     if args.train_classifier_only:
         freeze_for_classifier_only(model)
     model.train()
@@ -821,6 +847,9 @@ def main() -> None:
         f"SSL: threshold={args.confidence_threshold}, unlabeled_weight={args.unlabeled_loss_weight}, "
         f"DA={args.distribution_alignment}, ssl_seg_forward={not args.ssl_fast_classifier}, "
         f"teacher_precision={args.teacher_precision}, student_precision={args.student_precision}, "
+        f"teacher_classifier_count={len(teacher_classifier_models)}, "
+        f"teacher_classifier_blend_weight={args.teacher_classifier_blend_weight}, "
+        f"teacher_classifier_tta={args.teacher_classifier_tta}, "
         f"train_classifier_only={args.train_classifier_only}, "
         f"classifier_mixup_alpha={args.classifier_mixup_alpha}, "
         f"classifier_cutmix_alpha={args.classifier_cutmix_alpha}, "
@@ -850,7 +879,7 @@ def main() -> None:
     scaler = GradScaler(enabled=use_amp and args.student_precision == "fp16")
     da = DistributionAlignment(NUM_CLASSES, args.distribution_alignment_momentum) if args.distribution_alignment else None
     if args.diagnose_teacher_only:
-        diagnose_teacher_confidence(ema.module, unlabeled_loader, device, use_amp, args, da)
+        diagnose_teacher_confidence(ema.module, teacher_classifier_models, unlabeled_loader, device, use_amp, args, da)
         return
     best_score = -1.0
     history: list[dict[str, object]] = []
@@ -860,6 +889,7 @@ def main() -> None:
         train_metrics = train_one_epoch(
             model,
             ema,
+            teacher_classifier_models,
             supervised_loader,
             unlabeled_loader,
             optimizer,
