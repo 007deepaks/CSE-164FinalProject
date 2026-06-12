@@ -13,6 +13,7 @@ from starter.kaggle_metric import detailed_score
 from src.data.segmentation_dataset import SegmentationDataset
 from src.training.classifier_utils import classifier_logits_with_tta, load_classifier_checkpoints
 from src.training.multitask_utils import (
+    blend_classification_logits,
     build_val_solution_frame,
     load_multitask_checkpoint,
     semantic_mask_from_binary_and_class_logits,
@@ -38,6 +39,7 @@ def score_thresholds(
     max_val_samples: int | None,
     thresholds: list[float],
     tta: str,
+    classifier_blend_weight: float,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seg_model, _, saved_args = load_multitask_checkpoint(seg_checkpoint, device)
@@ -66,14 +68,11 @@ def score_thresholds(
         images = batch["image"].to(device, non_blocking=True)
         outputs = seg_model(images)
         classification_logits = outputs["classification"]
-        if classifier_models:
-            classification_logits = classifier_logits_with_tta(classifier_models, images, tta)
         if tta in {"hflip", "multi_crop"}:
             flipped_images = torch.flip(images, dims=(-1,))
             flipped_outputs = seg_model(flipped_images)
             flipped_classification_logits = flipped_outputs["classification"]
-            if not classifier_models:
-                classification_logits = 0.5 * (classification_logits + flipped_classification_logits)
+            classification_logits = 0.5 * (classification_logits + flipped_classification_logits)
             outputs = {
                 "segmentation": 0.5
                 * (outputs["segmentation"] + torch.flip(flipped_outputs["segmentation"], dims=(-1,))),
@@ -81,6 +80,13 @@ def score_thresholds(
             }
         else:
             outputs["classification"] = classification_logits
+        if classifier_models:
+            external_classification_logits = classifier_logits_with_tta(classifier_models, images, tta)
+            outputs["classification"] = blend_classification_logits(
+                outputs["classification"],
+                external_classification_logits,
+                classifier_blend_weight,
+            )
 
         for item_index, image_name in enumerate(batch["image_name"]):
             height = int(batch["original_height"][item_index])
@@ -135,6 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--thresholds", type=str, default="0.45,0.50,0.55,0.60,0.65,0.70,0.75,0.80")
     parser.add_argument("--tta", choices=["none", "hflip", "multi_crop"], default="none")
+    parser.add_argument("--classifier-blend-weight", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -150,6 +157,7 @@ def main() -> None:
         max_val_samples=args.max_val_samples,
         thresholds=parse_thresholds(args.thresholds),
         tta=args.tta,
+        classifier_blend_weight=args.classifier_blend_weight,
     )
 
 

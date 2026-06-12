@@ -124,6 +124,23 @@ def binary_prediction_from_logits(
     return (torch.softmax(segmentation_logits, dim=1)[:, 1] > seg_threshold).long()
 
 
+def blend_classification_logits(
+    multitask_logits: torch.Tensor,
+    classifier_logits: torch.Tensor,
+    classifier_weight: float,
+) -> torch.Tensor:
+    """Blend two classifiers in probability space and return log-prob logits."""
+    classifier_weight = min(1.0, max(0.0, classifier_weight))
+    if classifier_weight <= 0:
+        return multitask_logits
+    if classifier_weight >= 1:
+        return classifier_logits
+    multitask_probs = torch.softmax(multitask_logits.float(), dim=1)
+    classifier_probs = torch.softmax(classifier_logits.float(), dim=1)
+    blended_probs = (1.0 - classifier_weight) * multitask_probs + classifier_weight * classifier_probs
+    return torch.log(blended_probs.clamp_min(1e-12))
+
+
 def binary_segmentation_bce_loss(segmentation_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     if segmentation_logits.shape[1] != 1:
         return F.cross_entropy(segmentation_logits, target, ignore_index=IGNORE_ID)
@@ -184,6 +201,7 @@ def validate_multitask(
     segmentation_criterion: nn.Module | None = None,
     classification_criterion: nn.Module | None = None,
     classifier_models: list[nn.Module] | None = None,
+    classifier_blend_weight: float = 1.0,
     tta: str = "none",
     seg_threshold: float | None = None,
 ) -> dict[str, float]:
@@ -213,16 +231,20 @@ def validate_multitask(
         outputs = model(images)
         segmentation_logits = outputs["segmentation"]
         classification_logits = outputs["classification"]
-        if classifier_models:
-            classification_logits = classifier_logits_with_tta(classifier_models, images, tta)
         if tta in {"hflip", "multi_crop"}:
             flipped_images = torch.flip(images, dims=(-1,))
             flipped_outputs = model(flipped_images)
             flipped_classification_logits = flipped_outputs["classification"]
-            if not classifier_models:
-                classification_logits = 0.5 * (classification_logits + flipped_classification_logits)
+            classification_logits = 0.5 * (classification_logits + flipped_classification_logits)
             segmentation_logits = 0.5 * (
                 segmentation_logits + torch.flip(flipped_outputs["segmentation"], dims=(-1,))
+            )
+        if classifier_models:
+            external_classification_logits = classifier_logits_with_tta(classifier_models, images, tta)
+            classification_logits = blend_classification_logits(
+                classification_logits,
+                external_classification_logits,
+                classifier_blend_weight,
             )
         binary_predictions = binary_prediction_from_logits(segmentation_logits, seg_threshold)
         valid = masks != IGNORE_ID

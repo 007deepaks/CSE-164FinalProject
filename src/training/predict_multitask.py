@@ -18,6 +18,7 @@ from src.training.classifier_utils import (
     load_classifier_checkpoints,
 )
 from src.training.multitask_utils import (
+    blend_classification_logits,
     load_multitask_checkpoint,
     semantic_mask_from_binary_and_class_logits,
     semantic_mask_from_logits,
@@ -37,6 +38,7 @@ def predict(
     validate_with_starter: bool,
     tta: str,
     classifier_checkpoints: list[Path] | None,
+    classifier_blend_weight: float,
     seg_threshold: float | None,
     classifier_crop_mode: str,
     classifier_crop_padding: float,
@@ -74,7 +76,7 @@ def predict(
             outputs["classification"] = classification_logits
         if classifier_models:
             if classifier_crop_mode == "seg":
-                classification_logits = classifier_logits_full_and_seg_crop(
+                external_classification_logits = classifier_logits_full_and_seg_crop(
                     classifier_models,
                     images,
                     outputs["segmentation"],
@@ -84,7 +86,12 @@ def predict(
                     crop_weight=classifier_crop_weight,
                 )
             else:
-                classification_logits = classifier_logits_with_tta(classifier_models, images, tta)
+                external_classification_logits = classifier_logits_with_tta(classifier_models, images, tta)
+            classification_logits = blend_classification_logits(
+                classification_logits,
+                external_classification_logits,
+                classifier_blend_weight,
+            )
             outputs["classification"] = classification_logits
         for item_index, image_name in enumerate(batch["image_name"]):
             height = int(batch["original_height"][item_index])
@@ -144,6 +151,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-validate", action="store_true")
     parser.add_argument("--tta", choices=["none", "hflip", "multi_crop"], default="none")
     parser.add_argument("--classifier-checkpoint", type=Path, nargs="+")
+    parser.add_argument("--classifier-blend-weight", type=float, default=1.0)
     parser.add_argument("--seg-threshold", type=float)
     parser.add_argument("--classifier-crop-mode", choices=["none", "seg"], default="none")
     parser.add_argument("--classifier-crop-padding", type=float, default=0.20)
@@ -164,6 +172,7 @@ def main() -> None:
         validate_with_starter=not args.no_validate,
         tta=args.tta,
         classifier_checkpoints=args.classifier_checkpoint,
+        classifier_blend_weight=args.classifier_blend_weight,
         seg_threshold=args.seg_threshold,
         classifier_crop_mode=args.classifier_crop_mode,
         classifier_crop_padding=args.classifier_crop_padding,
